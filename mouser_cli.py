@@ -28,24 +28,50 @@ def _get_api_key() -> str:
     return key
 
 
+_last_request_time = 0.0
+_requests_today = 0
+
+def _enforce_rate_limit():
+    global _last_request_time, _requests_today
+    if _requests_today >= 1000:
+        print("WARNING: Reached 1000 requests limit for this session.", file=sys.stderr)
+    
+    now = time.time()
+    elapsed = now - _last_request_time
+    # 30 requests per minute -> 1 request every 2.1 seconds
+    if elapsed < 2.1:
+        time.sleep(2.1 - elapsed)
+    _last_request_time = time.time()
+    _requests_today += 1
+
+
 def _post_json(url: str, params: Dict[str, str], payload: Dict[str, Any],
                max_retries: int = 3, timeout: int = 20) -> Dict[str, Any]:
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     attempt = 0
     while True:
         attempt += 1
+        _enforce_rate_limit()
         try:
             resp = requests.post(url, params=params, json=payload, headers=headers, timeout=timeout)
         except requests.RequestException as e:
             if attempt <= max_retries:
-                time.sleep(1.5 * attempt)
+                delay = 2 ** attempt
+                print(f"Network error. Retrying in {delay}s...", file=sys.stderr)
+                time.sleep(delay)
                 continue
             raise RuntimeError(f"Network error: {e}") from e
 
-        if resp.status_code == 429 and attempt <= max_retries:
-            retry_after = int(resp.headers.get("Retry-After", "2") or "2")
-            time.sleep(retry_after)
-            continue
+        if resp.status_code == 429:
+            if attempt <= max_retries:
+                retry_after_str = resp.headers.get("Retry-After", "")
+                retry_after = int(retry_after_str) if retry_after_str.isdigit() else 0
+                delay = max(retry_after, 2 ** attempt)
+                print(f"Rate limit hit (429). Retrying in {delay}s...", file=sys.stderr)
+                time.sleep(delay)
+                continue
+            else:
+                raise RuntimeError("Max retries exceeded for 429 Rate Limit.")
 
         if resp.status_code >= 400:
             raise RuntimeError(f"Mouser API error {resp.status_code}: {resp.text[:500]}")
@@ -58,17 +84,17 @@ def _post_json(url: str, params: Dict[str, str], payload: Dict[str, Any],
 
 def fetch_by_partnumber(query: str, api_key: str, max_retries: int, timeout: int) -> Dict[str, Any]:
     params   = {"apiKey": api_key}
-    payload1 = {"SearchByPartNumberRequest": {"MouserPartNumber": query}}
+    payload1 = {"SearchByPartNumberRequest": {"MouserPartNumber": query, "records": 50}}
     data = _post_json(API_PARTNUMBER, params, payload1, max_retries, timeout)
     if _has_parts(data):
         return data
-    payload2 = {"SearchByPartNumberRequest": {"mouserPartNumber": query}}
+    payload2 = {"SearchByPartNumberRequest": {"mouserPartNumber": query, "records": 50}}
     return _post_json(API_PARTNUMBER, params, payload2, max_retries, timeout)
 
 
 def fetch_by_keyword(query: str, api_key: str, max_retries: int, timeout: int) -> Dict[str, Any]:
     params  = {"apiKey": api_key}
-    payload = {"SearchByKeywordRequest": {"keyword": query}}
+    payload = {"SearchByKeywordRequest": {"keyword": query, "records": 50}}
     return _post_json(API_KEYWORD, params, payload, max_retries, timeout)
 
 
