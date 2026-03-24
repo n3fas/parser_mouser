@@ -17,6 +17,7 @@ from mouser_cli import (
     print_table,
     write_xlsx,
 )
+from db_cache import get_cached_part, save_cached_part
 
 load_dotenv(find_dotenv(), override=False)
 
@@ -48,16 +49,36 @@ def _save_raw(data: Dict[str, Any], save_dir: Path, name: str) -> None:
 
 
 def _lookup_one(pn: str, api_key: str, retries: int = 3, timeout: int = 20,
-                save_raw_dir: Path | None = None) -> dict | None:
+                save_raw_dir: Path | None = None) -> dict:
+    
+    cached = get_cached_part(pn)
+    if cached:
+        print(f"  ⚡ Найдено в локальной БД: {pn}")
+        return cached
+
+    empty_row = {
+        "Запрошенный партномер": pn,
+        "Партномер Mouser": "-",
+        "Партномер производителя": "-",
+        "Производитель": "-",
+        "Категория": "-",
+        "Доступно": "-",
+        "Срок поставки": "-",
+        "Цена за единицу": "-",
+        "Описание": "-"
+    }
+
     if not _is_valid_pn(pn):
         print(f"  ⚠️  Пропускаю некорректный ввод: {pn!r}")
-        return None
+        empty_row["Описание"] = "Invalid PN"
+        return empty_row
 
     try:
         data_pn = fetch_by_partnumber(pn, api_key, retries, timeout)
     except Exception as e:
         print(f"  ❌ Ошибка запроса (partnumber): {e}")
-        return None
+        empty_row["Описание"] = f"Error: {e}"
+        return empty_row
 
     part = extract_first_part(data_pn)
     used_keyword = False
@@ -66,8 +87,9 @@ def _lookup_one(pn: str, api_key: str, retries: int = 3, timeout: int = 20,
         try:
             data_kw = fetch_by_keyword(pn, api_key, retries, timeout)
         except Exception as e:
-            print(f"  ❌ Ошибка запроса (keyword): {e}")
-            return None
+            print(f"  ❌ Ошибка запроса (Формат Excel.xls устарел и не поддерживается, пожалуйста, используйте формат Excel.xlsx): {e}")
+            empty_row["Описание"] = f"Error: {e}"
+            return empty_row
         part = extract_first_part(data_kw)
         used_keyword = True
         if save_raw_dir:
@@ -78,12 +100,92 @@ def _lookup_one(pn: str, api_key: str, retries: int = 3, timeout: int = 20,
 
     if not part:
         print("  ⚠️  Ничего не найдено.")
-        return None
+        empty_row["Описание"] = "Ничего не найдено"
+        save_cached_part(pn, empty_row)
+        return empty_row
 
-    row = transform_strict(part)
+    row = transform_strict(part, pn)
+    
+    # Replace None values with dashes in the resulting row
+    for k, v in row.items():
+        if v is None:
+            row[k] = "-"
+            
+    save_cached_part(pn, row)
     print("  ✓ Готово.")
     return row
 
+
+from openpyxl import load_workbook
+
+def _process_excel_file(filepath: str, api_key: str, save_raw_dir: Path | None):
+    p = Path(filepath)
+    if not p.exists():
+        print(f"  ❌ Файл {filepath} не найден.")
+        return
+
+    try:
+        wb = load_workbook(filepath, data_only=True)
+        ws = wb.active
+    except Exception as e:
+        print(f"  ❌ Ошибка чтения Excel: {e}")
+        return
+
+    part_col_idx = None
+    start_row = None
+
+    for row_idx, row in enumerate(ws.iter_rows(max_row=50), start=1):
+        for col_idx, cell in enumerate(row, start=1):
+            if cell.value and isinstance(cell.value, str):
+                val_clean = cell.value.strip().lower().replace(" ", "").replace(".", "")
+                if val_clean in ("partno", "partnumber"):
+                    part_col_idx = col_idx
+                    start_row = row_idx + 1
+                    break
+        if part_col_idx:
+            break
+
+    if not part_col_idx:
+        print("  ❌ Столбец с партномером ('Part no.', 'PART NUMBER' и т.д.) не найден (проверены первые 50 строк).")
+        return
+
+    print(f"  ✓ Найден целевой столбец (столбец {part_col_idx}, начиная со строки {start_row}).")
+
+    pns = []
+    for row_idx in range(start_row, ws.max_row + 1):
+        val = ws.cell(row=row_idx, column=part_col_idx).value
+        if val is None or str(val).strip() == "":
+            break
+        pns.append(str(val).strip())
+
+    if not pns:
+        print("  ⚠️  Список парт-номеров пуст.")
+        return
+
+    print(f"  ✓ Найдено {len(pns)} парт-номеров.")
+
+    chunks = [pns[i:i + 50] for i in range(0, len(pns), 50)]
+    print(f"  ✓ Разбито на {len(chunks)} пачек (по 50 макс).")
+
+    all_results = []
+
+    for i, chunk in enumerate(chunks, start=1):
+        print(f"\n  [Пачка {i}/{len(chunks)}] Обработка {len(chunk)} деталей...")
+        for pn in chunk:
+            print(f"  → Ищу: {pn} ...")
+            row = _lookup_one(pn, api_key, retries=3, timeout=20, save_raw_dir=save_raw_dir)
+            if row:
+                all_results.append(row)
+
+    if all_results:
+        out_name = f"mouser_excel_result_{p.stem}.xlsx"
+        try:
+            write_xlsx(all_results, out_name)
+            print(f"\n  ✓ Готово! Результаты сохранены в {out_name}")
+        except Exception as e:
+            print(f"  ❌ Ошибка сохранения итогового файла: {e}")
+    else:
+        print("\n  ⚠️  Нет успешных результатов для сохранения.")
 
 def main():
     try:
@@ -102,6 +204,7 @@ def main():
         print("3) Сохранить последние результаты в JSON")
         print("4) Указать папку для сохранения сырых ответов API (RAW)")
         print("5) Сохранить последние результаты в XLSX")
+        print("6) Обработать Excel-файл (ищет столбец 'Part no.', 'PART NUMBER' и т.д.)")
         print("0) Выход")
         choice = _ask("\nВыберите пункт меню: ")
 
@@ -126,7 +229,10 @@ def main():
 
             if results_map:
                 print("\nРезультаты:")
-                print_table(list(results_map.values()))
+                print_table(
+                    list(results_map.values()), 
+                    display_cols=["Запрошенный партномер", "Партномер Mouser", "Производитель", "Категория", "Описание"]
+                )
             else:
                 print("  ⚠️  Пусто — нет валидных результатов.")
 
@@ -167,6 +273,7 @@ def main():
                     print(f"  ✓ RAW будут сохраняться в: {p}")
                 except Exception as e:
                     print(f"  ❌ Не удалось создать папку: {e}")
+                    
         elif choice == "5":
             if not results_map:
                 print("  ⚠️  Нет данных для сохранения. Сначала выполните поиск (пункт 1).")
@@ -176,6 +283,14 @@ def main():
                 write_xlsx(list(results_map.values()), out)
             except Exception as e:
                 print(f"  ❌ Ошибка при сохранении XLSX: {e}")
+                
+        elif choice == "6":
+            filepath = _ask("Введите путь к Excel файлу: ")
+            if not filepath:
+                print("  ⚠️  Отмена.")
+                continue
+            _process_excel_file(filepath, api_key, save_raw_dir)
+            
         else:
             print("  ⚠️  Неверный выбор. Попробуйте ещё раз.")
 

@@ -2,3 +2,8 @@
 .env
 __pycache__/
 /results/
+*.xlsx
+*.xls
+*.csv
+*.log
+*.json

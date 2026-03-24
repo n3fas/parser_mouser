@@ -5,6 +5,7 @@ import json
 import time
 import csv
 import argparse
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Iterable
 
@@ -14,11 +15,32 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
+try:
+    from deep_translator import GoogleTranslator
+except ImportError:
+    GoogleTranslator = None
+
 API_PARTNUMBER = "https://api.mouser.com/api/v1.0/search/partnumber"
 API_KEYWORD    = "https://api.mouser.com/api/v1.0/search/keyword"
 
 load_dotenv(find_dotenv(), override=False)
 
+_translation_cache: Dict[str, str] = {}
+
+def _translate_to_ru(text: Optional[str]) -> Optional[str]:
+    if not text or not text.strip() or GoogleTranslator is None:
+        return text
+    text_clean = text.strip()
+    if text_clean in _translation_cache:
+        return _translation_cache[text_clean]
+    
+    try:
+        translated = GoogleTranslator(source='auto', target='ru').translate(text_clean)
+        _translation_cache[text_clean] = translated
+        return translated
+    except Exception as e:
+        print(f"WARNING: Translation failed for '{text_clean}': {e}", file=sys.stderr)
+        return text
 
 def _get_api_key() -> str:
     key = os.getenv("MOUSER_API_KEY")
@@ -30,19 +52,29 @@ def _get_api_key() -> str:
 
 _last_request_time = 0.0
 _requests_today = 0
+_rate_limit_lock = threading.Lock()
 
 def _enforce_rate_limit():
     global _last_request_time, _requests_today
-    if _requests_today >= 1000:
-        print("WARNING: Reached 1000 requests limit for this session.", file=sys.stderr)
     
-    now = time.time()
-    elapsed = now - _last_request_time
-    # 30 requests per minute -> 1 request every 2.1 seconds
-    if elapsed < 2.1:
-        time.sleep(2.1 - elapsed)
-    _last_request_time = time.time()
-    _requests_today += 1
+    with _rate_limit_lock:
+        if _requests_today >= 1000:
+            print("WARNING: Reached 1000 requests limit for this session.", file=sys.stderr)
+        
+        now = time.time()
+        elapsed = now - _last_request_time
+        # 30 requests per minute -> 1 request every 2.1 seconds
+        if elapsed < 2.1:
+            sleep_time = 2.1 - elapsed
+            _last_request_time = now + sleep_time
+        else:
+            sleep_time = 0.0
+            _last_request_time = now
+            
+        _requests_today += 1
+        
+    if sleep_time > 0:
+        time.sleep(sleep_time)
 
 
 def _post_json(url: str, params: Dict[str, str], payload: Dict[str, Any],
@@ -148,7 +180,10 @@ def _first_unit_price(price_breaks: Optional[List[Dict[str, Any]]]) -> Optional[
     return (str(p).strip() if p is not None else None)
 
 
-def transform_strict(part: Dict[str, Any]) -> Dict[str, Any]:
+def transform_strict(part: Dict[str, Any], query: str = "") -> Dict[str, Any]:
+    mouser_pn    = part.get("MouserPartNumber")
+    mfr_pn       = part.get("ManufacturerPartNumber")
+    manufacturer = part.get("Manufacturer")
     category     = part.get("Category") or part.get("CategoryName") or part.get("ProductLine") or None
     availability = part.get("Availability")
     stock        = _parse_stock(availability)
@@ -156,25 +191,64 @@ def transform_strict(part: Dict[str, Any]) -> Dict[str, Any]:
     unit_price   = _first_unit_price(part.get("PriceBreaks") or [])
     description  = part.get("Description") or part.get("ProductDescription") or None
 
-    return {
-        "Product Category": category,
-        "Stock": stock,
-        "Factory Lead Time": lead_time,
-        "Unit Price": unit_price,
-        "Description": description,
-    }
+    category_ru = _translate_to_ru(category) if category else None
+    description_ru = _translate_to_ru(description) if description else None
+
+    res = {}
+    if query:
+        res["Запрошенный партномер"] = query
+    res["Партномер Mouser"] = mouser_pn
+    res["Партномер производителя"] = mfr_pn
+    res["Производитель"] = manufacturer
+    res["Категория"] = category_ru
+    res["Доступно"] = stock
+    res["Срок поставки"] = lead_time
+    res["Цена за единицу"] = unit_price
+    res["Описание"] = description_ru
+
+    # Product Compliance
+    compliance = part.get("ProductCompliance") or []
+    if isinstance(compliance, list):
+        for item in compliance:
+            if isinstance(item, dict):
+                c_name = item.get("ComplianceName")
+                c_val = item.get("ComplianceValue")
+                if c_name:
+                    res[f"Compliance код: {c_name}"] = c_val
+    elif isinstance(compliance, dict):
+        for k, v in compliance.items():
+            res[f"Compliance код: {k}"] = v
+
+    return res
 
 
 def write_csv(rows: List[Dict[str, Any]], out_path: str) -> None:
-    fields = list(rows[0].keys()) if rows else []
+    if not rows:
+        return
+    fields = []
+    for r in rows:
+        for k in r.keys():
+            if k not in fields:
+                fields.append(k)
+                
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in rows:
             w.writerow(r)
 
-def print_table(rows: List[Dict[str, Any]]) -> None:
-    cols = list(rows[0].keys())
+def print_table(rows: List[Dict[str, Any]], display_cols: Optional[List[str]] = None) -> None:
+    if not rows:
+        return
+    cols = []
+    if display_cols:
+        cols = display_cols
+    else:
+        for r in rows:
+            for k in r.keys():
+                if k not in cols:
+                    cols.append(k)
+                
     widths = {c: max(len(c), max((len(str(r.get(c) or "")) for r in rows), default=0)) for c in cols}
     header = " | ".join(c.ljust(widths[c]) for c in cols)
     sep = "-+-".join("-" * widths[c] for c in cols)
@@ -223,11 +297,19 @@ def _to_number_or_text(value):
         return s
 
 def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
+    if not rows:
+        return
+        
     wb = Workbook()
     ws = wb.active
     ws.title = "Mouser"
 
-    cols = list(rows[0].keys())
+    cols = []
+    for r in rows:
+        for k in r.keys():
+            if k not in cols:
+                cols.append(k)
+                
     header_font = Font(bold=True)
     ws.append(cols)
     for col_idx, col_name in enumerate(cols, start=1):
@@ -283,7 +365,15 @@ def main():
         save_dir = Path(args.save_raw)
         save_dir.mkdir(parents=True, exist_ok=True)
 
+    from db_cache import get_cached_part, save_cached_part
+
     for q in q_iter:
+        cached = get_cached_part(q)
+        if cached:
+            print(f"CACHE HIT: {q}", file=sys.stderr)
+            results.append(cached)
+            continue
+
         if not _is_valid_pn(q):
             print(f"WARNING: skipped invalid query token: {q!r}", file=sys.stderr)
             continue
@@ -311,9 +401,27 @@ def main():
 
         if not part:
             print(f"WARNING: No parts found for {q}", file=sys.stderr)
+            empty_res = {
+                "Запрошенный партномер": q,
+                "Партномер Mouser": "-",
+                "Партномер производителя": "-",
+                "Производитель": "-",
+                "Категория": "-",
+                "Доступно": "-",
+                "Срок поставки": "-",
+                "Цена за единицу": "-",
+                "Описание": "Ничего не найдено"
+            }
+            save_cached_part(q, empty_res)
+            results.append(empty_res)
             continue
 
-        results.append(transform_strict(part))
+        row = transform_strict(part, q)
+        for k, v in row.items():
+            if v is None:
+                row[k] = "-"
+        save_cached_part(q, row)
+        results.append(row)
 
     if not results:
         print("No data produced.")
@@ -335,7 +443,10 @@ def main():
         out_path = args.out or "mouser_results.xlsx"
         write_xlsx(results, out_path)
     else:
-        print_table(results)
+        print_table(
+            results,
+            display_cols=["Запрошенный партномер", "Партномер Mouser", "Производитель", "Категория", "Описание"]
+        )
 
 
 if __name__ == "__main__":
