@@ -17,22 +17,67 @@ def _get_connection():
         "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_history ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "user_id INTEGER, "
+        "pn TEXT, "
+        "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
     return conn
+
+def add_to_history(user_id: int, pn: str):
+    if not pn:
+        return
+    pn_clean = pn.strip().upper()
+    with _db_lock:
+        with _get_connection() as conn:
+            # Не добавляем дубликат, если это был последний запрос этого пользователя
+            cursor = conn.cursor()
+            cursor.execute("SELECT pn FROM user_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1", (user_id,))
+            last_row = cursor.fetchone()
+            if last_row and last_row[0] == pn_clean:
+                return
+                
+            conn.execute(
+                "INSERT INTO user_history (user_id, pn) VALUES (?, ?)",
+                (user_id, pn_clean)
+            )
+
+def get_user_history(user_id: int, limit: int = 50) -> list[str]:
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT pn FROM user_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", 
+                (user_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [r[0] for r in rows]
+
+def clear_user_history(user_id: int):
+    with _db_lock:
+        with _get_connection() as conn:
+            conn.execute("DELETE FROM user_history WHERE user_id = ?", (user_id,))
 
 def get_cached_part(pn: str) -> Optional[Dict[str, Any]]:
     """Возвращает кэшированные данные детали по парт-номеру, если они есть."""
     if not pn:
         return None
-    pn_clean = pn.strip().lower()
+    # Нормализуем для БД: убираем пробелы и плюсы, как и перед API
+    pn_clean = pn.strip().lower().replace(" ", "").replace("+", "")
     
     with _db_lock:
         with _get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT data FROM part_cache WHERE pn = ?", (pn_clean,))
+            cursor.execute("SELECT data, datetime(timestamp, 'localtime') FROM part_cache WHERE pn = ?", (pn_clean,))
             row = cursor.fetchone()
             if row:
                 try:
-                    return json.loads(row[0])
+                    data = json.loads(row[0])
+                    data["Дата кэширования"] = row[1]
+                    return data
                 except Exception:
                     return None
     return None
@@ -41,7 +86,8 @@ def save_cached_part(pn: str, data: Dict[str, Any]):
     """Сохраняет данные детали в кэш."""
     if not pn or not data:
         return
-    pn_clean = pn.strip().lower()
+    # Нормализуем для БД: убираем пробелы и плюсы
+    pn_clean = pn.strip().lower().replace(" ", "").replace("+", "")
     
     with _db_lock:
         with _get_connection() as conn:
@@ -49,3 +95,21 @@ def save_cached_part(pn: str, data: Dict[str, Any]):
                 "INSERT OR REPLACE INTO part_cache (pn, data) VALUES (?, ?)",
                 (pn_clean, json.dumps(data, ensure_ascii=False))
             )
+
+def get_cache_stats() -> int:
+    """Возвращает количество записей в кэше деталей."""
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM part_cache")
+            return cursor.fetchone()[0]
+
+def delete_cached_part(pn: str):
+    """Удаляет деталь из кэша (для принудительного обновления)."""
+    if not pn:
+        return
+    # Нормализуем для БД: убираем пробелы и плюсы
+    pn_clean = pn.strip().lower().replace(" ", "").replace("+", "")
+    with _db_lock:
+        with _get_connection() as conn:
+            conn.execute("DELETE FROM part_cache WHERE pn = ?", (pn_clean,))

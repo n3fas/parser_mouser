@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -30,7 +31,13 @@ def _ask(prompt: str) -> str:
 
 
 def _split_pns(s: str) -> List[str]:
-    parts = [t.strip() for t in s.replace(",", " ").split() if t.strip()]
+    # Регулярка ищет текст в двойных кавычках, в одинарных кавычках, либо текст без пробелов и запятых
+    matches = re.finditer(r'"([^"]+)"|\'([^\']+)\'|([^,\s]+)', s)
+    parts = []
+    for m in matches:
+        val = m.group(1) or m.group(2) or m.group(3)
+        if val and val.strip():
+            parts.append(val.strip())
     return parts
 
 
@@ -49,12 +56,13 @@ def _save_raw(data: Dict[str, Any], save_dir: Path, name: str) -> None:
 
 
 def _lookup_one(pn: str, api_key: str, retries: int = 3, timeout: int = 20,
-                save_raw_dir: Path | None = None) -> dict:
+                save_raw_dir: Path | None = None, force_update: bool = False) -> dict:
     
-    cached = get_cached_part(pn)
-    if cached:
-        print(f"  ⚡ Найдено в локальной БД: {pn}")
-        return cached
+    if not force_update:
+        cached = get_cached_part(pn)
+        if cached:
+            print(f"  ⚡ Найдено в локальной БД: {pn}")
+            return cached
 
     empty_row = {
         "Запрошенный партномер": pn,
@@ -62,10 +70,9 @@ def _lookup_one(pn: str, api_key: str, retries: int = 3, timeout: int = 20,
         "Партномер производителя": "-",
         "Производитель": "-",
         "Категория": "-",
-        "Доступно": "-",
-        "Срок поставки": "-",
-        "Цена за единицу": "-",
-        "Описание": "-"
+        "Описание": "-",
+        "Ссылка на фото": "-",
+        "Даташит": "-"
     }
 
     if not _is_valid_pn(pn):

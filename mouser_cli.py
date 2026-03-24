@@ -42,12 +42,51 @@ def _translate_to_ru(text: Optional[str]) -> Optional[str]:
         print(f"WARNING: Translation failed for '{text_clean}': {e}", file=sys.stderr)
         return text
 
+_api_keys = []
+_current_key_idx = 0
+_key_lock = threading.Lock()
+
+def _init_api_keys():
+    global _api_keys
+    with _key_lock:
+        if _api_keys:
+            return
+        
+        # Поддерживаем как один ключ MOUSER_API_KEY, так и несколько ключей MOUSER_API_KEY_1, MOUSER_API_KEY_2 и т.д.
+        # Либо через запятую в MOUSER_API_KEYS
+        keys = []
+        
+        # 1. Проверяем MOUSER_API_KEYS (через запятую)
+        multi_keys = os.getenv("MOUSER_API_KEYS")
+        if multi_keys:
+            keys.extend([k.strip() for k in multi_keys.split(",") if k.strip()])
+            
+        # 2. Проверяем MOUSER_API_KEY_1, MOUSER_API_KEY_2...
+        for i in range(1, 20):
+            k = os.getenv(f"MOUSER_API_KEY_{i}")
+            if k and k.strip() not in keys:
+                keys.append(k.strip())
+                
+        # 3. Проверяем классический MOUSER_API_KEY
+        single_key = os.getenv("MOUSER_API_KEY")
+        if single_key and single_key.strip() not in keys:
+            keys.append(single_key.strip())
+            
+        if not keys:
+            print("ERROR: No Mouser API keys found. Set MOUSER_API_KEYS (comma separated) or MOUSER_API_KEY in .env", file=sys.stderr)
+            sys.exit(2)
+            
+        _api_keys = keys
+        print(f"Loaded {len(_api_keys)} API keys for rotation.", file=sys.stderr)
+
 def _get_api_key() -> str:
-    key = os.getenv("MOUSER_API_KEY")
-    if not key:
-        print("ERROR: MOUSER_API_KEY is not set. Put it to .env or env.", file=sys.stderr)
-        sys.exit(2)
-    return key
+    global _current_key_idx
+    _init_api_keys()
+    
+    with _key_lock:
+        key = _api_keys[_current_key_idx]
+        _current_key_idx = (_current_key_idx + 1) % len(_api_keys)
+        return key
 
 
 _last_request_time = 0.0
@@ -58,14 +97,18 @@ def _enforce_rate_limit():
     global _last_request_time, _requests_today
     
     with _rate_limit_lock:
-        if _requests_today >= 1000:
-            print("WARNING: Reached 1000 requests limit for this session.", file=sys.stderr)
+        if _requests_today >= (1000 * len(_api_keys)):
+            print(f"WARNING: Reached limit for this session ({1000 * len(_api_keys)} requests).", file=sys.stderr)
         
         now = time.time()
         elapsed = now - _last_request_time
-        # 30 requests per minute -> 1 request every 2.1 seconds
-        if elapsed < 2.1:
-            sleep_time = 2.1 - elapsed
+        
+        # Если у нас 5 ключей, то каждый может делать 1 запрос раз в 2.1 секунды
+        # В идеале мы можем делать запросы в N раз быстрее, т.е. раз в (2.1 / N) секунд
+        delay_between_requests = 2.1 / max(1, len(_api_keys))
+        
+        if elapsed < delay_between_requests:
+            sleep_time = delay_between_requests - elapsed
             _last_request_time = now + sleep_time
         else:
             sleep_time = 0.0
@@ -115,18 +158,20 @@ def _post_json(url: str, params: Dict[str, str], payload: Dict[str, Any],
 
 
 def fetch_by_partnumber(query: str, api_key: str, max_retries: int, timeout: int) -> Dict[str, Any]:
+    clean_query = query.replace(" ", "").replace("+", "")
     params   = {"apiKey": api_key}
-    payload1 = {"SearchByPartNumberRequest": {"MouserPartNumber": query, "records": 50}}
+    payload1 = {"SearchByPartNumberRequest": {"MouserPartNumber": clean_query, "records": 50}}
     data = _post_json(API_PARTNUMBER, params, payload1, max_retries, timeout)
     if _has_parts(data):
         return data
-    payload2 = {"SearchByPartNumberRequest": {"mouserPartNumber": query, "records": 50}}
+    payload2 = {"SearchByPartNumberRequest": {"mouserPartNumber": clean_query, "records": 50}}
     return _post_json(API_PARTNUMBER, params, payload2, max_retries, timeout)
 
 
 def fetch_by_keyword(query: str, api_key: str, max_retries: int, timeout: int) -> Dict[str, Any]:
+    clean_query = query.replace(" ", "").replace("+", "")
     params  = {"apiKey": api_key}
-    payload = {"SearchByKeywordRequest": {"keyword": query, "records": 50}}
+    payload = {"SearchByKeywordRequest": {"keyword": clean_query, "records": 50}}
     return _post_json(API_KEYWORD, params, payload, max_retries, timeout)
 
 
@@ -143,7 +188,7 @@ def extract_first_part(api_response: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 
 _AVAIL_RE = re.compile(r"([\d,]+)")
-_PN_ALLOWED_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_PN_ALLOWED_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+\- ]*$")
 
 def _is_valid_pn(q: str) -> bool:
     q = q.strip()
@@ -185,11 +230,9 @@ def transform_strict(part: Dict[str, Any], query: str = "") -> Dict[str, Any]:
     mfr_pn       = part.get("ManufacturerPartNumber")
     manufacturer = part.get("Manufacturer")
     category     = part.get("Category") or part.get("CategoryName") or part.get("ProductLine") or None
-    availability = part.get("Availability")
-    stock        = _parse_stock(availability)
-    lead_time    = part.get("FactoryLeadTime") or part.get("LeadTime") or part.get("ManufacturerLeadTimeWeeks") or None
-    unit_price   = _first_unit_price(part.get("PriceBreaks") or [])
     description  = part.get("Description") or part.get("ProductDescription") or None
+    image_url    = part.get("ImagePath") or None
+    datasheet    = part.get("DataSheetUrl") or None
 
     category_ru = _translate_to_ru(category) if category else None
     description_ru = _translate_to_ru(description) if description else None
@@ -201,10 +244,9 @@ def transform_strict(part: Dict[str, Any], query: str = "") -> Dict[str, Any]:
     res["Партномер производителя"] = mfr_pn
     res["Производитель"] = manufacturer
     res["Категория"] = category_ru
-    res["Доступно"] = stock
-    res["Срок поставки"] = lead_time
-    res["Цена за единицу"] = unit_price
     res["Описание"] = description_ru
+    res["Ссылка на фото"] = image_url
+    res["Даташит"] = datasheet
 
     # Product Compliance
     compliance = part.get("ProductCompliance") or []
@@ -407,10 +449,9 @@ def main():
                 "Партномер производителя": "-",
                 "Производитель": "-",
                 "Категория": "-",
-                "Доступно": "-",
-                "Срок поставки": "-",
-                "Цена за единицу": "-",
-                "Описание": "Ничего не найдено"
+                "Описание": "Ничего не найдено",
+                "Ссылка на фото": "-",
+                "Даташит": "-"
             }
             save_cached_part(q, empty_res)
             results.append(empty_res)
