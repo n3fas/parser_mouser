@@ -19,10 +19,18 @@ from openpyxl import load_workbook, Workbook
 class UpdateState(StatesGroup):
     waiting_for_data = State()
 
+class DocsCategoryState(StatesGroup):
+    waiting_for_add = State()
+    waiting_for_remove = State()
+
 # Импортируем готовые функции из нашего проекта
 from mouser_cli import _get_api_key, write_xlsx
 from mouser_menu import _lookup_one, _split_pns
-from db_cache import add_to_history, get_user_history, clear_user_history, get_cache_stats, delete_cached_part
+from db_cache import (
+    add_to_history, get_user_history, clear_user_history, 
+    get_cache_stats, delete_cached_part,
+    add_docs_category, remove_docs_category, get_docs_categories
+)
 
 load_dotenv(find_dotenv(), override=False)
 
@@ -54,9 +62,20 @@ def get_inline_menu_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Актуализация", callback_data="menu_update")],
+            [InlineKeyboardButton(text="📋 Категории для доков", callback_data="menu_docs_cats")],
             [InlineKeyboardButton(text="🕒 История запросов", callback_data="menu_history")],
             [InlineKeyboardButton(text="📊 Статистика БД", callback_data="menu_stats")],
             [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="menu_clear_history")]
+        ]
+    )
+
+def get_docs_cats_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить категорию", callback_data="docs_cat_add")],
+            [InlineKeyboardButton(text="➖ Удалить категорию", callback_data="docs_cat_remove")],
+            [InlineKeyboardButton(text="📜 Список категорий", callback_data="docs_cat_list")],
+            [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="menu_back")]
         ]
     )
 
@@ -138,6 +157,106 @@ async def handle_menu_command(message: Message) -> None:
         reply_markup=get_inline_menu_keyboard()
     )
 
+@dp.callback_query(F.data == "menu_docs_cats")
+async def callback_menu_docs_cats(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📋 <b>Управление категориями для разрешительных документов</b>\n\n"
+        "Детали из этих категорий будут выделяться <b>бледно-желтым цветом</b> в Excel-отчетах.",
+        reply_markup=get_docs_cats_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu_back")
+async def callback_menu_back(callback: CallbackQuery):
+    await callback.message.edit_text(
+        get_menu_text(),
+        reply_markup=get_inline_menu_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "docs_cat_list")
+async def callback_docs_cat_list(callback: CallbackQuery):
+    cats = get_docs_categories()
+    if not cats:
+        await callback.message.answer("Список категорий пуст.")
+    else:
+        text = "📜 <b>Категории с обязательными документами:</b>\n\n"
+        text += "\n".join([f"• <code>{c}</code>" for c in cats])
+        await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "docs_cat_add")
+async def callback_docs_cat_add(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DocsCategoryState.waiting_for_add)
+    await callback.message.answer("Введите название категории (как она пишется в отчетах), которую нужно ДОБАВИТЬ:")
+    await callback.answer()
+
+@dp.callback_query(F.data == "docs_cat_remove")
+async def callback_docs_cat_remove(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DocsCategoryState.waiting_for_remove)
+    await callback.message.answer("Введите название категории, которую нужно УДАЛИТЬ из списка:")
+    await callback.answer()
+
+@dp.message(DocsCategoryState.waiting_for_add)
+async def handle_docs_cat_add(message: Message, state: FSMContext):
+    # Если прислали файл вместо текста
+    if message.document:
+        doc = message.document
+        if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
+            await message.answer("Пожалуйста, отправьте список категорий текстом (каждая с новой строки) или файлом .xlsx")
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            input_path = tmp.name
+        await message.bot.download(doc, destination=input_path)
+
+        try:
+            wb = load_workbook(input_path, data_only=True)
+            ws = wb.active
+            count = 0
+            for row in ws.iter_rows(min_row=1, max_col=1):
+                val = row[0].value
+                if val and str(val).strip():
+                    if add_docs_category(str(val).strip()):
+                        count += 1
+            await message.answer(f"✅ Импорт завершен! Добавлено <b>{count}</b> новых категорий из файла.")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка импорта: {e}")
+        finally:
+            os.remove(input_path)
+            await state.clear()
+        return
+
+    # Обработка текстового ввода (можно несколько строк)
+    lines = [line.strip() for line in message.text.split('\n') if line.strip()]
+    if not lines:
+        await message.answer("Пустой ввод.")
+        return
+
+    added = 0
+    for cat_name in lines:
+        if add_docs_category(cat_name):
+            added += 1
+
+    if len(lines) == 1:
+        if added:
+            await message.answer(f"✅ Категория «<code>{lines[0]}</code>» добавлена.")
+        else:
+            await message.answer(f"⚠️ Категория «<code>{lines[0]}</code>» уже есть в списке.")
+    else:
+        await message.answer(f"✅ Обработано {len(lines)} строк. Добавлено новых категорий: <b>{added}</b>.")
+
+    await state.clear()
+
+@dp.message(DocsCategoryState.waiting_for_remove)
+async def handle_docs_cat_remove(message: Message, state: FSMContext):
+    cat_name = message.text.strip()
+    if remove_docs_category(cat_name):
+        await message.answer(f"✅ Категория «<code>{cat_name}</code>» удалена из списка.")
+    else:
+        await message.answer(f"⚠️ Категория не найдена в списке.")
+    await state.clear()
+
 @dp.callback_query(F.data == "menu_update")
 async def callback_menu_update(callback: CallbackQuery, state: FSMContext):
     await state.set_state(UpdateState.waiting_for_data)
@@ -155,10 +274,10 @@ async def callback_menu_history(callback: CallbackQuery):
     if not history:
         await callback.message.answer("Ваша история запросов пуста.")
         return
-        
+
     text = "🕒 <b>Ваша история последних запросов (до 50 шт):</b>\n\n"
     text += "\n".join([f"• <code>{pn}</code>" for pn in history])
-    
+
     # Разделяем длинный текст на части, если он больше 4000 символов
     if len(text) > 4000:
         for i in range(0, len(text), 4000):
@@ -196,16 +315,16 @@ def format_text_result(results):
         lines.append(f"Описание: {desc}")
         if cache_date:
             lines.append(f"<i>Взято из БД: {cache_date}</i>")
-        
+
         links = []
         if ds and ds != "-":
             links.append(f'<a href="{ds}">📄 Даташит</a>')
         if img and img != "-":
             links.append(f'<a href="{img}">🖼 Фото</a>')
-            
+
         if links:
             lines.append(" | ".join(links))
-            
+
         lines.append("-" * 25)
     return "\n".join(lines)
 
@@ -247,29 +366,29 @@ async def handle_text(message: Message, bot: Bot, state: FSMContext) -> None:
 
     update_text = " (принудительное обновление)..." if force_update else "..."
     msg = await message.answer(f"⏳ Ищу информацию по {len(pns)} деталям{update_text}")
-    
+
     # Сохраняем в историю
     for pn in pns:
         add_to_history(message.from_user.id, pn)
-    
+
     # Сохраняем последние PNs для выгрузки
     _user_last_pns[message.from_user.id] = pns
 
     # Запускаем синхронный парсинг
     results = await asyncio.to_thread(process_pns_sync, pns, api_key, force_update)
-    
+
     if not results:
         await msg.edit_text("⚠️ Ничего не найдено или произошла ошибка.")
         return
 
     out_text = format_text_result(results)
-    
+
     # Клавиатура
     keyboard = []
     if len(pns) == 1:
         # Если одна деталь, даем возможность очистить кэш
         keyboard.append([InlineKeyboardButton(text="🔄 Очистить кэш этой детали", callback_data=f"clear_{pns[0][:40]}")])
-    
+
     keyboard.append([InlineKeyboardButton(text="📄 Выгрузить это в Excel", callback_data="export_excel")])
     markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -298,14 +417,14 @@ async def callback_export_excel(callback: CallbackQuery):
 
     await callback.message.edit_reply_markup(reply_markup=None)
     msg = await callback.message.answer("⏳ Формирую Excel-файл...")
-    
+
     api_key = _get_api_key()
     results = await asyncio.to_thread(process_pns_sync, pns, api_key)
-    
+
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp_name = tmp.name
     await asyncio.to_thread(write_xlsx, results, tmp_name)
-    
+
     file = FSInputFile(tmp_name, filename="mouser_results.xlsx")
     await callback.message.answer_document(file)
     os.remove(tmp_name)
@@ -323,6 +442,37 @@ async def callback_clear_cache(callback: CallbackQuery):
 async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None:
     # Проверяем состояние
     current_state = await state.get_state()
+
+    # ЕСЛИ МЫ В РЕЖИМЕ ДОБАВЛЕНИЯ КАТЕГОРИЙ - импортируем их из Excel
+    if current_state == DocsCategoryState.waiting_for_add.state:
+        doc = message.document
+        if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
+            await message.answer("Пожалуйста, отправьте файл в формате .xlsx")
+            return
+
+        msg = await message.answer("⏳ Импортирую категории из файла...")
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            input_path = tmp.name
+        await bot.download(doc, destination=input_path)
+
+        try:
+            wb = load_workbook(input_path, data_only=True)
+            ws = wb.active
+            count = 0
+            # Берем значения из первой колонки
+            for row in ws.iter_rows(min_row=1, max_col=1):
+                val = row[0].value
+                if val and str(val).strip():
+                    if add_docs_category(str(val).strip()):
+                        count += 1
+            await msg.edit_text(f"✅ Импорт завершен! Добавлено <b>{count}</b> новых категорий.")
+        except Exception as e:
+            await msg.edit_text(f"❌ Ошибка импорта: {e}")
+        finally:
+            os.remove(input_path)
+            await state.clear()
+        return
+
     force_update = current_state == UpdateState.waiting_for_data.state
     if force_update:
         await state.clear()

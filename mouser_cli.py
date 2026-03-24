@@ -12,13 +12,17 @@ from typing import Any, Dict, List, Optional, Iterable
 import requests
 from dotenv import load_dotenv, find_dotenv
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 
 try:
     from deep_translator import GoogleTranslator
 except ImportError:
     GoogleTranslator = None
+
+# Будет импортировано позже внутри функций, чтобы избежать круговых импортов
+# или импортируем сейчас, если структура позволяет.
+# В mouser_cli.py уже есть вызов db_cache внутри main()
 
 API_PARTNUMBER = "https://api.mouser.com/api/v1.0/search/partnumber"
 API_KEYWORD    = "https://api.mouser.com/api/v1.0/search/keyword"
@@ -342,6 +346,11 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
     if not rows:
         return
         
+    try:
+        from db_cache import is_docs_category
+    except ImportError:
+        def is_docs_category(x): return False
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Mouser"
@@ -359,11 +368,20 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 
+    pale_yellow_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
     for r in rows:
         out_row = []
         for c in cols:
             out_row.append(_to_number_or_text(r.get(c)))
+        
         ws.append(out_row)
+        
+        # Если категория требует разрешительных документов, красим всю строку
+        category = r.get("Категория")
+        if category and is_docs_category(category):
+            for cell in ws[ws.max_row]:
+                cell.fill = pale_yellow_fill
 
     ws.freeze_panes = "A2"
 

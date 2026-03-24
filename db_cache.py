@@ -25,7 +25,51 @@ def _get_connection():
         "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS docs_categories ("
+        "name TEXT PRIMARY KEY"
+        ")"
+    )
     return conn
+
+def add_docs_category(name: str) -> bool:
+    if not name: return False
+    name_clean = name.strip()
+    with _db_lock:
+        with _get_connection() as conn:
+            try:
+                conn.execute("INSERT INTO docs_categories (name) VALUES (?)", (name_clean,))
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+def remove_docs_category(name: str) -> bool:
+    if not name: return False
+    name_clean = name.strip()
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM docs_categories WHERE name = ? COLLATE NOCASE", (name_clean,))
+            return cursor.rowcount > 0
+
+def get_docs_categories() -> list[str]:
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM docs_categories ORDER BY name")
+            return [r[0] for r in cursor.fetchall()]
+
+def is_docs_category(category: str) -> bool:
+    if not category: return False
+    cat_clean = category.strip().lower()
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM docs_categories")
+            for row in cursor.fetchall():
+                if row[0].strip().lower() == cat_clean:
+                    return True
+    return False
 
 def add_to_history(user_id: int, pn: str):
     if not pn:
