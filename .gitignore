@@ -7,4 +7,4 @@ __pycache__/
 *.csv
 *.log
 *.json
-mouser_profile/
+mouser_profile*/
