@@ -30,6 +30,11 @@ def _get_connection():
         "name TEXT PRIMARY KEY"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS labeling_categories ("
+        "name TEXT PRIMARY KEY"
+        ")"
+    )
     return conn
 
 def add_docs_category(name: str) -> bool:
@@ -66,6 +71,45 @@ def is_docs_category(category: str) -> bool:
         with _get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM docs_categories")
+            for row in cursor.fetchall():
+                if row[0].strip().lower() == cat_clean:
+                    return True
+    return False
+
+def add_labeling_category(name: str) -> bool:
+    if not name: return False
+    name_clean = name.strip()
+    with _db_lock:
+        with _get_connection() as conn:
+            try:
+                conn.execute("INSERT INTO labeling_categories (name) VALUES (?)", (name_clean,))
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+def remove_labeling_category(name: str) -> bool:
+    if not name: return False
+    name_clean = name.strip()
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM labeling_categories WHERE name = ? COLLATE NOCASE", (name_clean,))
+            return cursor.rowcount > 0
+
+def get_labeling_categories() -> list[str]:
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM labeling_categories ORDER BY name")
+            return [r[0] for r in cursor.fetchall()]
+
+def is_labeling_category(category: str) -> bool:
+    if not category: return False
+    cat_clean = category.strip().lower()
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM labeling_categories")
             for row in cursor.fetchall():
                 if row[0].strip().lower() == cat_clean:
                     return True

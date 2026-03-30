@@ -247,7 +247,8 @@ def transform_strict(part: Dict[str, Any], query: str = "") -> Dict[str, Any]:
     res["Партномер Mouser"] = mouser_pn
     res["Партномер производителя"] = mfr_pn
     res["Производитель"] = manufacturer
-    res["Категория"] = category_ru
+    res["Категория (EN)"] = category # Оригинал на английском
+    res["Категория"] = category_ru # Перевод на русский
     res["Описание"] = description_ru
     res["Ссылка на фото"] = image_url
     res["Даташит"] = datasheet
@@ -347,9 +348,10 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
         return
         
     try:
-        from db_cache import is_docs_category
+        from db_cache import is_docs_category, is_labeling_category
     except ImportError:
         def is_docs_category(x): return False
+        def is_labeling_category(x): return False
 
     wb = Workbook()
     ws = wb.active
@@ -369,6 +371,7 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
         cell.alignment = Alignment(horizontal="center")
 
     pale_yellow_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    light_red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
     for r in rows:
         out_row = []
@@ -377,11 +380,21 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
         
         ws.append(out_row)
         
-        # Если категория требует разрешительных документов, красим всю строку
-        category = r.get("Категория")
-        if category and is_docs_category(category):
+        # Окрашивание строки
+        category_en = r.get("Категория (EN)")
+        fill_to_apply = None
+        
+        if category_en:
+            # Сначала проверяем на менее приоритетную маркировку (красный)
+            if is_labeling_category(category_en):
+                fill_to_apply = light_red_fill
+            # Затем проверяем на документы (желтый). Если сработает, цвет перезапишется.
+            if is_docs_category(category_en):
+                fill_to_apply = pale_yellow_fill
+        
+        if fill_to_apply:
             for cell in ws[ws.max_row]:
-                cell.fill = pale_yellow_fill
+                cell.fill = fill_to_apply
 
     ws.freeze_panes = "A2"
 
@@ -466,6 +479,7 @@ def main():
                 "Партномер Mouser": "-",
                 "Партномер производителя": "-",
                 "Производитель": "-",
+                "Категория (EN)": "-",
                 "Категория": "-",
                 "Описание": "Ничего не найдено",
                 "Ссылка на фото": "-",

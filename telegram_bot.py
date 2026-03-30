@@ -23,13 +23,18 @@ class DocsCategoryState(StatesGroup):
     waiting_for_add = State()
     waiting_for_remove = State()
 
+class LabelingCategoryState(StatesGroup):
+    waiting_for_add = State()
+    waiting_for_remove = State()
+
 # Импортируем готовые функции из нашего проекта
 from mouser_cli import _get_api_key, write_xlsx
 from mouser_menu import _lookup_one, _split_pns
 from db_cache import (
     add_to_history, get_user_history, clear_user_history, 
     get_cache_stats, delete_cached_part,
-    add_docs_category, remove_docs_category, get_docs_categories
+    add_docs_category, remove_docs_category, get_docs_categories,
+    add_labeling_category, remove_labeling_category, get_labeling_categories
 )
 
 load_dotenv(find_dotenv(), override=False)
@@ -63,6 +68,7 @@ def get_inline_menu_keyboard():
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Актуализация", callback_data="menu_update")],
             [InlineKeyboardButton(text="📋 Категории для доков", callback_data="menu_docs_cats")],
+            [InlineKeyboardButton(text="🏷 Категории для маркировки", callback_data="menu_labeling_cats")],
             [InlineKeyboardButton(text="🕒 История запросов", callback_data="menu_history")],
             [InlineKeyboardButton(text="📊 Статистика БД", callback_data="menu_stats")],
             [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="menu_clear_history")]
@@ -72,10 +78,20 @@ def get_inline_menu_keyboard():
 def get_docs_cats_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить категорию", callback_data="docs_cat_add")],
-            [InlineKeyboardButton(text="➖ Удалить категорию", callback_data="docs_cat_remove")],
-            [InlineKeyboardButton(text="📜 Список категорий", callback_data="docs_cat_list")],
-            [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="menu_back")]
+            [InlineKeyboardButton(text="➕ Добавить", callback_data="docs_cat_add")],
+            [InlineKeyboardButton(text="➖ Удалить", callback_data="docs_cat_remove")],
+            [InlineKeyboardButton(text="📜 Список", callback_data="docs_cat_list")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
+        ]
+    )
+
+def get_labeling_cats_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить", callback_data="labeling_cat_add")],
+            [InlineKeyboardButton(text="➖ Удалить", callback_data="labeling_cat_remove")],
+            [InlineKeyboardButton(text="📜 Список", callback_data="labeling_cat_list")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
         ]
     )
 
@@ -255,6 +271,104 @@ async def handle_docs_cat_remove(message: Message, state: FSMContext):
         await message.answer(f"✅ Категория «<code>{cat_name}</code>» удалена из списка.")
     else:
         await message.answer(f"⚠️ Категория не найдена в списке.")
+    await state.clear()
+
+@dp.message(Command("history"))
+async def handle_history_command(message: Message):
+    history = get_user_history(message.from_user.id)
+    if not history:
+        await message.answer("Ваша история запросов пуста.")
+        return
+        
+    text = "🕒 <b>Ваша история последних запросов (до 50 шт):</b>\n\n"
+    text += "\n".join([f"• <code>{pn}</code>" for pn in history])
+    
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await message.answer(text[i:i+4000])
+    else:
+        await message.answer(text)
+
+@dp.message(Command("stats"))
+async def handle_stats_command(message: Message):
+    count = get_cache_stats()
+    await message.answer(f"📊 <b>Статистика базы данных:</b>\n\nВ локальном кэше сохранено деталей: <b>{count}</b>")
+
+@dp.callback_query(F.data == "menu_labeling_cats")
+async def callback_menu_labeling_cats(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🏷 <b>Управление категориями для маркировки</b>\n\n"
+        "Детали из этих категорий будут выделяться <b>бледно-зеленым цветом</b> в Excel-отчетах.",
+        reply_markup=get_labeling_cats_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "labeling_cat_list")
+async def callback_labeling_cat_list(callback: CallbackQuery):
+    cats = get_labeling_categories()
+    if not cats:
+        await callback.message.answer("Список категорий маркировки пуст.")
+    else:
+        text = "📜 <b>Категории товаров подлежащих маркировке:</b>\n\n"
+        text += "\n".join([f"• <code>{c}</code>" for c in cats])
+        await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "labeling_cat_add")
+async def callback_labeling_cat_add(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(LabelingCategoryState.waiting_for_add)
+    await callback.message.answer("Введите название категории маркировки (текстом или файлом Excel):")
+    await callback.answer()
+
+@dp.callback_query(F.data == "labeling_cat_remove")
+async def callback_labeling_cat_remove(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(LabelingCategoryState.waiting_for_remove)
+    await callback.message.answer("Введите название категории маркировки для УДАЛЕНИЯ:")
+    await callback.answer()
+
+@dp.message(LabelingCategoryState.waiting_for_add)
+async def handle_labeling_cat_add(message: Message, state: FSMContext):
+    if message.document:
+        # Реиспользуем логику импорта из Excel для маркировки
+        doc = message.document
+        if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
+            await message.answer("Отправьте Excel файл .xlsx")
+            return
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            input_path = tmp.name
+        await message.bot.download(doc, destination=input_path)
+        try:
+            wb = load_workbook(input_path, data_only=True)
+            ws = wb.active
+            count = 0
+            for row in ws.iter_rows(min_row=1, max_col=1):
+                val = row[0].value
+                if val and str(val).strip():
+                    if add_labeling_category(str(val).strip()):
+                        count += 1
+            await message.answer(f"✅ Импорт завершен! Добавлено <b>{count}</b> категорий маркировки.")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: {e}")
+        finally:
+            os.remove(input_path)
+            await state.clear()
+        return
+
+    lines = [line.strip() for line in message.text.split('\n') if line.strip()]
+    added = 0
+    for cat in lines:
+        if add_labeling_category(cat):
+            added += 1
+    await message.answer(f"✅ Добавлено категорий маркировки: <b>{added}</b>.")
+    await state.clear()
+
+@dp.message(LabelingCategoryState.waiting_for_remove)
+async def handle_labeling_cat_remove(message: Message, state: FSMContext):
+    cat_name = message.text.strip()
+    if remove_labeling_category(cat_name):
+        await message.answer(f"✅ Категория маркировки «<code>{cat_name}</code>» удалена.")
+    else:
+        await message.answer(f"⚠️ Категория не найдена.")
     await state.clear()
 
 @dp.callback_query(F.data == "menu_update")
@@ -579,12 +693,9 @@ async def main() -> None:
         
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     
-    # Настраиваем кнопку меню слева от поля ввода
+    # Настраиваем только ОДНУ команду в меню, чтобы пользователь не видел список слеш-команд
     await bot.set_my_commands([
-        BotCommand(command="start", description="Запустить бота"),
-        BotCommand(command="menu", description="Главное меню"),
-        BotCommand(command="history", description="История запросов"),
-        BotCommand(command="stats", description="Статистика БД")
+        BotCommand(command="menu", description="Открыть главное меню")
     ])
     
     print("Бот запущен. Ожидание сообщений...")
