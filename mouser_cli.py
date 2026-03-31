@@ -348,10 +348,11 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
         return
         
     try:
-        from db_cache import is_docs_category, is_labeling_category
+        from db_cache import is_docs_category, is_labeling_category, is_ip_brand
     except ImportError:
         def is_docs_category(x): return False
         def is_labeling_category(x): return False
+        def is_ip_brand(x): return False
 
     wb = Workbook()
     ws = wb.active
@@ -372,6 +373,8 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
 
     pale_yellow_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
     light_red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    light_blue_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    ip_font = Font(bold=True, color="7030A0") # Фиолетовый жирный шрифт для ТРОИС
 
     for r in rows:
         out_row = []
@@ -383,6 +386,7 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
         # Окрашивание строки
         category_en = r.get("Категория (EN)")
         fill_to_apply = None
+        font_to_apply = None
         
         if category_en:
             # Сначала проверяем на менее приоритетную маркировку (красный)
@@ -391,10 +395,27 @@ def write_xlsx(rows: List[Dict[str, Any]], out_path: str) -> None:
             # Затем проверяем на документы (желтый). Если сработает, цвет перезапишется.
             if is_docs_category(category_en):
                 fill_to_apply = pale_yellow_fill
+            if is_labeling_category(category_en) and is_docs_category(category_en):
+                fill_to_apply = light_blue_fill
+
+        # Проверка на ТРОИС
+        mfr_from_api = r.get("Производитель")
+        brand_from_excel = r.get("brand_from_excel")
         
-        if fill_to_apply:
-            for cell in ws[ws.max_row]:
+        is_ip = False
+        if brand_from_excel and is_ip_brand(brand_from_excel):
+            is_ip = True
+        elif mfr_from_api and is_ip_brand(mfr_from_api):
+            is_ip = True
+        
+        if is_ip:
+            font_to_apply = ip_font
+        
+        for cell in ws[ws.max_row]:
+            if fill_to_apply:
                 cell.fill = fill_to_apply
+            if font_to_apply:
+                cell.font = font_to_apply
 
     ws.freeze_panes = "A2"
 

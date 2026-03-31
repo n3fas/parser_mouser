@@ -4,6 +4,7 @@ import asyncio
 import logging
 import tempfile
 import math
+import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv, find_dotenv
@@ -27,14 +28,18 @@ class LabelingCategoryState(StatesGroup):
     waiting_for_add = State()
     waiting_for_remove = State()
 
+class IPRegistryState(StatesGroup):
+    waiting_for_file = State()
+
 # Импортируем готовые функции из нашего проекта
-from mouser_cli import _get_api_key, write_xlsx
+from mouser_cli import _get_api_key, write_xlsx, _translate_to_ru
 from mouser_menu import _lookup_one, _split_pns
 from db_cache import (
     add_to_history, get_user_history, clear_user_history, 
-    get_cache_stats, delete_cached_part,
-    add_docs_category, remove_docs_category, get_docs_categories,
-    add_labeling_category, remove_labeling_category, get_labeling_categories
+    get_cache_stats, delete_cached_part, get_all_cached_pns,
+    add_docs_category, remove_docs_category, get_docs_categories, get_docs_categories_count, is_docs_category,
+    add_labeling_category, remove_labeling_category, get_labeling_categories, get_labeling_categories_count, is_labeling_category,
+    clear_ip_brands, add_ip_brand, is_ip_brand, get_ip_brands_count, get_all_ip_brands
 )
 
 load_dotenv(find_dotenv(), override=False)
@@ -59,7 +64,7 @@ def get_menu_text():
         "🤖 <b>Как работает парсер Mouser:</b>\n\n"
         "Отправьте мне:\n"
         "1️⃣ <b>Текст</b> с парт-номерами (через пробел или запятую) - я верну информацию прямо сюда.\n"
-        "2️⃣ <b>Excel-файл</b> (.xlsx) - я найду в нем столбец 'Part no.' (или 'PART NUMBER'), "
+        "2️⃣ <b>Excel-файл</b> (ВАЖНО: формат - .xlsx) - я найду в нем столбец 'Part no.' (или 'PART NUMBER'), "
         "соберу все номера и отправлю обратно заполненный Excel-файл со всеми данными, включая перевод."
     )
 
@@ -67,10 +72,12 @@ def get_inline_menu_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Актуализация", callback_data="menu_update")],
+            [InlineKeyboardButton(text="🔄 Актуализация ПОЛНАЯ", callback_data="menu_update_all")],
+            [InlineKeyboardButton(text="🛡 Реестр ТРОИС (Интеллектуалка)", callback_data="menu_ip_registry")],
             [InlineKeyboardButton(text="📋 Категории для доков", callback_data="menu_docs_cats")],
             [InlineKeyboardButton(text="🏷 Категории для маркировки", callback_data="menu_labeling_cats")],
+            [InlineKeyboardButton(text="📊 Статистика базы", callback_data="menu_stats")],
             [InlineKeyboardButton(text="🕒 История запросов", callback_data="menu_history")],
-            [InlineKeyboardButton(text="📊 Статистика БД", callback_data="menu_stats")],
             [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="menu_clear_history")]
         ]
     )
@@ -108,41 +115,55 @@ def process_pns_sync(pns, api_key, force_update=False):
     return results
 
 def extract_pns_from_excel_sync(filepath):
-    """Извлекает партномера из Excel файла"""
+    """Извлекает партномера и бренды из Excel файла"""
     try:
         wb = load_workbook(filepath, data_only=True)
         ws = wb.active
     except Exception as e:
-        return None, f"Ошибка чтения Excel: {e}"
+        return None, f"Ошибка чтения Excel: {e}. Попробуйте сохранить его в новом формате \" .xlsx \"."
 
     part_col_idx = None
+    brand_col_idx = None
     start_row = None
+
+    pn_col_names = ("partno", "partnumber", "partnum", "pn", "p/n")
+    brand_col_names = ("brand", "mfr", "mark", "manufacturer")
 
     for row_idx, row in enumerate(ws.iter_rows(max_row=50), start=1):
         for col_idx, cell in enumerate(row, start=1):
             if cell.value and isinstance(cell.value, str):
                 val_clean = cell.value.strip().lower().replace(" ", "").replace(".", "")
-                if val_clean in ("partno", "partnumber"):
+                if val_clean in pn_col_names and not part_col_idx:
                     part_col_idx = col_idx
-                    start_row = row_idx + 1
-                    break
-        if part_col_idx:
+                elif val_clean in brand_col_names and not brand_col_idx:
+                    brand_col_idx = col_idx
+        
+        if part_col_idx: # If we found the main column, we can assume the header row is this one.
+            start_row = row_idx + 1
             break
 
     if not part_col_idx:
         return None, "NO_COLUMN"
 
-    pns = []
+    parts_data = []
     for row_idx in range(start_row, ws.max_row + 1):
-        val = ws.cell(row=row_idx, column=part_col_idx).value
-        if val is None or str(val).strip() == "":
+        pn_val = ws.cell(row=row_idx, column=part_col_idx).value
+        if pn_val is None or str(pn_val).strip() == "":
             break
-        pns.append(str(val).strip())
+        
+        brand_val = None
+        if brand_col_idx:
+            brand_val = ws.cell(row=row_idx, column=brand_col_idx).value
+        
+        parts_data.append({
+            "pn": str(pn_val).strip(),
+            "brand": str(brand_val).strip() if brand_val else None
+        })
 
-    if not pns:
+    if not parts_data:
         return None, "Список парт-номеров пуст."
 
-    return pns, None
+    return parts_data, None
 
 def create_template_excel():
     """Создает пустой шаблон Excel"""
@@ -158,6 +179,16 @@ def get_progress_bar(current, total, length=10):
     filled = int(length * percent)
     bar = "⬛" * filled + "⬜" * (length - filled)
     return f"{bar} ({int(percent * 100)}%)"
+
+def translate_cats_sync(cats):
+    res = []
+    for c in cats:
+        t = _translate_to_ru(c)
+        if t and t != c:
+            res.append(f"• <code>{c}</code> ({t})")
+        else:
+            res.append(f"• <code>{c}</code>")
+    return res
 
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
@@ -183,22 +214,43 @@ async def callback_menu_docs_cats(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data == "menu_back")
-async def callback_menu_back(callback: CallbackQuery):
+async def callback_menu_back(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
-        get_menu_text(),
-        reply_markup=get_inline_menu_keyboard()
+        await state.clear(),
+            get_menu_text(),
+            reply_markup=get_inline_menu_keyboard()
     )
     await callback.answer()
 
-@dp.callback_query(F.data == "docs_cat_list")
+@dp.callback_query(F.data.startswith("docs_list_") | (F.data == "docs_cat_list"))
 async def callback_docs_cat_list(callback: CallbackQuery):
-    cats = get_docs_categories()
-    if not cats:
-        await callback.message.answer("Список категорий пуст.")
-    else:
-        text = "📜 <b>Категории с обязательными документами:</b>\n\n"
-        text += "\n".join([f"• <code>{c}</code>" for c in cats])
-        await callback.message.answer(text)
+    page = 0 if callback.data == "docs_cat_list" else int(callback.data.split("_")[2])
+    limit = 20
+    offset = page * limit
+    total = get_docs_categories_count()
+    cats = get_docs_categories(limit=limit, offset=offset)
+    
+    if not cats and total == 0:
+        await callback.message.edit_text("Список категорий пуст.", reply_markup=get_docs_cats_keyboard())
+        await callback.answer()
+        return
+
+    cats_text_list = await asyncio.to_thread(translate_cats_sync, cats)
+    text = f"📜 <b>Категории с обязательными документами (страница {page+1} из {math.ceil(total/limit) if total > 0 else 1}):</b>\n\n"
+    text += "\n".join(cats_text_list)
+    
+    kb = []
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"docs_list_{page-1}"))
+    if offset + limit < total:
+        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"docs_list_{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_docs_cats")])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
 
 @dp.callback_query(F.data == "docs_cat_add")
@@ -303,15 +355,35 @@ async def callback_menu_labeling_cats(callback: CallbackQuery):
     )
     await callback.answer()
 
-@dp.callback_query(F.data == "labeling_cat_list")
+@dp.callback_query(F.data.startswith("labeling_list_") | (F.data == "labeling_cat_list"))
 async def callback_labeling_cat_list(callback: CallbackQuery):
-    cats = get_labeling_categories()
-    if not cats:
-        await callback.message.answer("Список категорий маркировки пуст.")
-    else:
-        text = "📜 <b>Категории товаров подлежащих маркировке:</b>\n\n"
-        text += "\n".join([f"• <code>{c}</code>" for c in cats])
-        await callback.message.answer(text)
+    page = 0 if callback.data == "labeling_cat_list" else int(callback.data.split("_")[2])
+    limit = 20
+    offset = page * limit
+    total = get_labeling_categories_count()
+    cats = get_labeling_categories(limit=limit, offset=offset)
+    
+    if not cats and total == 0:
+        await callback.message.edit_text("Список категорий маркировки пуст.", reply_markup=get_labeling_cats_keyboard())
+        await callback.answer()
+        return
+
+    cats_text_list = await asyncio.to_thread(translate_cats_sync, cats)
+    text = f"📜 <b>Категории товаров подлежащих маркировке (страница {page+1} из {math.ceil(total/limit) if total > 0 else 1}):</b>\n\n"
+    text += "\n".join(cats_text_list)
+    
+    kb = []
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"labeling_list_{page-1}"))
+    if offset + limit < total:
+        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"labeling_list_{page+1}"))
+    if nav_row:
+        kb.append(nav_row)
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_labeling_cats")])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
 
 @dp.callback_query(F.data == "labeling_cat_add")
@@ -381,6 +453,114 @@ async def callback_menu_update(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+@dp.callback_query(F.data == "menu_update_all")
+async def callback_menu_update_all(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "⚠️ <b>Внимание!</b>\n\n"
+        "Полная актуализация проверит все сохраненные детали в базе данных "
+        "и обновит их информацию с сайта Mouser.\n\n"
+        "Это может занять длительное время и потратить лимиты API. Вы уверены?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, начать", callback_data="start_update_all")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_back")]
+        ])
+    )
+    await callback.answer()
+
+async def run_full_update(message: Message, pns: list):
+    try:
+        api_key = _get_api_key()
+    except SystemExit:
+        await message.answer("Ошибка: MOUSER_API_KEY не настроен на сервере.")
+        return
+
+    total = len(pns)
+    processed = 0
+    last_update_time = asyncio.get_event_loop().time()
+    
+    for pn in pns:
+        await asyncio.to_thread(_lookup_one, pn, api_key, 3, 20, None, True)
+        processed += 1
+        
+        current_time = asyncio.get_event_loop().time()
+        if current_time - last_update_time > 3.0 or processed == total:
+            try:
+                await message.edit_text(
+                    f"⏳ Полная актуализация базы...\n\n"
+                    f"Обработано: {processed} / {total}\n"
+                    f"{get_progress_bar(processed, total)}"
+                )
+                last_update_time = current_time
+            except Exception:
+                pass
+                
+    try:
+        await message.edit_text(f"✅ Полная актуализация завершена!\nУспешно обновлено деталей: <b>{total}</b>.")
+    except Exception:
+        await message.answer(f"✅ Полная актуализация завершена!\nУспешно обновлено деталей: <b>{total}</b>.")
+
+@dp.callback_query(F.data == "start_update_all")
+async def callback_start_update_all(callback: CallbackQuery):
+    pns = get_all_cached_pns()
+    if not pns:
+        await callback.answer("База данных пуста.", show_alert=True)
+        return
+    
+    await callback.message.edit_text(f"⏳ Начинаю полную актуализацию {len(pns)} деталей...\nЭто может занять много времени.")
+    asyncio.create_task(run_full_update(callback.message, pns))
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu_ip_registry")
+async def callback_menu_ip_registry(callback: CallbackQuery, state: FSMContext):
+    count = get_ip_brands_count()
+    await state.set_state(IPRegistryState.waiting_for_file)
+    await callback.message.edit_text(
+        f"🛡 <b>Реестр ТРОИС (Интеллектуалка)</b>\n\n"
+        f"В базе сейчас активных марок: <b>{count}</b>\n\n"
+        "Отправьте Excel-файл с реестром для <b>обновления</b> базы или выгрузите текущий список.\n\n"
+        "• Столбец A: Рег. номер (напр. 00012/00001-012/ТЗ-130204)\n"
+        "• Столбец B: Марка товара\n"
+        "• Столбец E: Дата окончания срока (учитываются даты ≥ сегодня)\n\n"
+        "<i>Внимание: при загрузке нового файла старая база будет очищена!</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Выгрузить текущий список", callback_data="export_ip_brands")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
+        ])
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "export_ip_brands")
+async def callback_export_ip_brands(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    
+    brands = await asyncio.to_thread(get_all_ip_brands)
+    
+    if not brands:
+        await callback.answer("База брендов ТРОИС пуста.", show_alert=True)
+        return
+
+    msg = await callback.message.answer("⏳ Формирую Excel-файл...")
+
+    def write_brands_to_excel(brands_list, path):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "IP Brands"
+        ws.append(["Brand Name"])
+        for brand in brands_list:
+            ws.append([brand])
+        wb.save(path)
+
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp_name = tmp.name
+        
+    await asyncio.to_thread(write_brands_to_excel, brands, tmp_name)
+
+    file = FSInputFile(tmp_name, filename="ip_brands_export.xlsx")
+    await callback.message.answer_document(file, caption=f"✅ Выгружено {len(brands)} брендов из реестра ТРОИС.")
+    os.remove(tmp_name)
+    await msg.delete()
+    await callback.answer()
+
 @dp.callback_query(F.data == "menu_history")
 async def callback_menu_history(callback: CallbackQuery):
     await callback.answer()
@@ -415,8 +595,10 @@ def format_text_result(results):
     for r in results:
         req_pn = r.get("Запрошенный партномер", "-")
         mouser_pn = r.get("Партномер Mouser", "-")
+        mfr_pn = r.get("Партномер производителя", "-")
         mfr = r.get("Производитель", "-")
         cat = r.get("Категория", "-")
+        cat_en = r.get("Категория (EN)")
         desc = r.get("Описание", "-")
         img = r.get("Ссылка на фото")
         ds = r.get("Даташит")
@@ -424,8 +606,29 @@ def format_text_result(results):
 
         lines.append(f"🔍 <b>{req_pn}</b>")
         lines.append(f"Mouser PN: <code>{mouser_pn}</code>")
+        lines.append(f"Mfr. PN: <code>{mfr_pn}</code>")
         lines.append(f"Производитель: {mfr}")
         lines.append(f"Категория: {cat}")
+        
+        warnings = []
+        if cat_en and cat_en != "-":
+            if is_labeling_category(cat_en):
+                warnings.append("🟢 Требуется маркировка")
+            if is_docs_category(cat_en):
+                warnings.append("🟡 Нужны разрешительные документы")
+        
+        brand_from_excel = r.get("brand_from_excel")
+        is_ip = False
+        if brand_from_excel and is_ip_brand(brand_from_excel):
+            is_ip = True
+        elif mfr and mfr != "-" and is_ip_brand(mfr):
+            is_ip = True
+        
+        if is_ip:
+            warnings.append("⛔ Интеллектуальная собственность (ТРОИС)")
+            
+        if warnings:
+            lines.append("⚠️ <b>Внимание:</b> " + ", ".join(warnings))
         lines.append(f"Описание: {desc}")
         if cache_date:
             lines.append(f"<i>Взято из БД: {cache_date}</i>")
@@ -557,10 +760,61 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     # Проверяем состояние
     current_state = await state.get_state()
 
+    if current_state == IPRegistryState.waiting_for_file.state:
+        doc = message.document
+        if not doc.file_name.lower().endswith(('.xlsx')):
+            await message.answer("Пожалуйста, отправьте файл в формате .xlsx")
+            return
+
+        msg = await message.answer("⏳ Читаю реестр ТРОИС...")
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            input_path = tmp.name
+        await bot.download(doc, destination=input_path)
+
+        try:
+            wb = load_workbook(input_path, data_only=True)
+            ws = wb.active
+            
+            clear_ip_brands()
+            count = 0
+            today = datetime.datetime.now().date()
+            
+            for row in ws.iter_rows(min_row=1):
+                if len(row) >= 5:
+                    val_a = row[0].value
+                    brand = row[1].value
+                    date_val = row[4].value
+                    
+                    if val_a and brand:
+                        val_a_str = str(val_a).strip()
+                        if "/" in val_a_str:
+                            exp_date = None
+                            if isinstance(date_val, datetime.datetime):
+                                exp_date = date_val.date()
+                            elif isinstance(date_val, str):
+                                try:
+                                    parts = date_val.split('.')
+                                    if len(parts) == 3:
+                                        exp_date = datetime.date(int(parts[2]), int(parts[1]), int(parts[0]))
+                                except Exception:
+                                    pass
+                            
+                            if exp_date and exp_date >= today:
+                                if add_ip_brand(str(brand)):
+                                    count += 1
+                                    
+            await msg.edit_text(f"✅ Реестр ТРОИС успешно обновлен! Загружено активных марок: <b>{count}</b>.")
+        except Exception as e:
+            await msg.edit_text(f"❌ Ошибка при чтении файла: {e}")
+        finally:
+            os.remove(input_path)
+            await state.clear()
+        return
+
     # ЕСЛИ МЫ В РЕЖИМЕ ДОБАВЛЕНИЯ КАТЕГОРИЙ - импортируем их из Excel
     if current_state == DocsCategoryState.waiting_for_add.state:
         doc = message.document
-        if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
+        if not doc.file_name.lower().endswith(('.xlsx')):
             await message.answer("Пожалуйста, отправьте файл в формате .xlsx")
             return
 
@@ -600,7 +854,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
             return
 
     doc = message.document
-    if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
+    if not doc.file_name.lower().endswith(('.xlsx')):
         await message.answer("Пожалуйста, отправьте файл в формате .xlsx")
         return
 
@@ -618,7 +872,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     await bot.download(doc, destination=input_path)
     
     await msg.edit_text("⏳ Читаю Excel-файл...")
-    pns, err = await asyncio.to_thread(extract_pns_from_excel_sync, input_path)
+    parts_data, err = await asyncio.to_thread(extract_pns_from_excel_sync, input_path)
     os.remove(input_path)
     
     if err == "NO_COLUMN":
@@ -635,15 +889,15 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
         await msg.edit_text(f"❌ {err}")
         return
 
-    if not pns:
+    if not parts_data:
         await msg.edit_text("⚠️ Нет результатов для сохранения.")
         return
 
     # Сохраняем в историю
-    for pn in pns:
-        add_to_history(message.from_user.id, pn)
+    for item in parts_data:
+        add_to_history(message.from_user.id, item['pn'])
 
-    total_pns = len(pns)
+    total_pns = len(parts_data)
     update_text = " (принудительное обновление)" if force_update else ""
     await msg.edit_text(f"⏳ Начинаю обработку {total_pns} деталей{update_text}...\n{get_progress_bar(0, total_pns)}")
 
@@ -652,10 +906,14 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     last_update_time = asyncio.get_event_loop().time()
     
     # Обрабатываем по одному, чтобы прогресс бар был плавным
-    for pn in pns:
+    for item in parts_data:
+        pn = item['pn']
+        brand_from_excel = item['brand']
         # Вызываем _lookup_one в отдельном потоке для каждого партномера
         row = await asyncio.to_thread(_lookup_one, pn, api_key, 3, 20, None, force_update)
         if row:
+            if brand_from_excel:
+                row['brand_from_excel'] = brand_from_excel
             all_results.append(row)
             
         processed += 1
