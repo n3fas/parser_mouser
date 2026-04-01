@@ -16,6 +16,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from openpyxl import load_workbook, Workbook
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from typing import Callable, Dict, Any, Awaitable
 
 class UpdateState(StatesGroup):
     waiting_for_data = State()
@@ -31,6 +33,10 @@ class LabelingCategoryState(StatesGroup):
 class IPRegistryState(StatesGroup):
     waiting_for_file = State()
 
+class UserManagementState(StatesGroup):
+    waiting_for_add_id = State()
+    waiting_for_remove_id = State()
+
 # Импортируем готовые функции из нашего проекта
 from mouser_cli import _get_api_key, write_xlsx, _translate_to_ru
 from mouser_menu import _lookup_one, _split_pns
@@ -39,12 +45,14 @@ from db_cache import (
     get_cache_stats, delete_cached_part, get_all_cached_pns,
     add_docs_category, remove_docs_category, get_docs_categories, get_docs_categories_count, is_docs_category,
     add_labeling_category, remove_labeling_category, get_labeling_categories, get_labeling_categories_count, is_labeling_category,
-    clear_ip_brands, add_ip_brand, is_ip_brand, get_ip_brands_count, get_all_ip_brands
+    clear_ip_brands, add_ip_brand, is_ip_brand, get_ip_brands_count, get_all_ip_brands,
+    add_user, remove_user, is_user_allowed, get_all_users
 )
 
 load_dotenv(find_dotenv(), override=False)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 if not TOKEN:
     print("ВНИМАНИЕ: Переменная TELEGRAM_BOT_TOKEN не задана в .env файле.")
 
@@ -57,6 +65,15 @@ if ALLOWED_THREAD_ID:
         print("ВНИМАНИЕ: ALLOWED_THREAD_ID должен быть числом.")
         ALLOWED_THREAD_ID = None
 
+if ADMIN_USER_ID:
+    try:
+        ADMIN_USER_ID = int(ADMIN_USER_ID)
+    except ValueError:
+        print("ВНИМАНИЕ: ADMIN_USER_ID должен быть числом.")
+        ADMIN_USER_ID = None
+else:
+    print("ВНИМАНИЕ: ADMIN_USER_ID не задан. Бот будет доступен всем.")
+
 dp = Dispatcher()
 
 def get_menu_text():
@@ -68,19 +85,22 @@ def get_menu_text():
         "соберу все номера и отправлю обратно заполненный Excel-файл со всеми данными, включая перевод."
     )
 
-def get_inline_menu_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Актуализация", callback_data="menu_update")],
-            [InlineKeyboardButton(text="🔄 Актуализация ПОЛНАЯ", callback_data="menu_update_all")],
-            [InlineKeyboardButton(text="🛡 Реестр ТРОИС (Интеллектуалка)", callback_data="menu_ip_registry")],
-            [InlineKeyboardButton(text="📋 Категории для доков", callback_data="menu_docs_cats")],
-            [InlineKeyboardButton(text="🏷 Категории для маркировки", callback_data="menu_labeling_cats")],
-            [InlineKeyboardButton(text="📊 Статистика базы", callback_data="menu_stats")],
-            [InlineKeyboardButton(text="🕒 История запросов", callback_data="menu_history")],
-            [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="menu_clear_history")]
-        ]
-    )
+def get_inline_menu_keyboard(user_id: int):
+    kb = [
+        [InlineKeyboardButton(text="🔄 Актуализация", callback_data="menu_update")],
+        [InlineKeyboardButton(text="🔄 Актуализация ПОЛНАЯ", callback_data="menu_update_all")],
+        [InlineKeyboardButton(text="🛡 Реестр ТРОИС (Интеллектуалка)", callback_data="menu_ip_registry")],
+        [InlineKeyboardButton(text="📋 Категории для доков", callback_data="menu_docs_cats")],
+        [InlineKeyboardButton(text="🏷 Категории для маркировки", callback_data="menu_labeling_cats")],
+        [InlineKeyboardButton(text="📊 Статистика базы", callback_data="menu_stats")],
+        [InlineKeyboardButton(text="🕒 История запросов", callback_data="menu_history")],
+        [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="menu_clear_history")]
+    ]
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        # Вставляем кнопку управления пользователями на 3-ю позицию
+        kb.insert(2, [InlineKeyboardButton(text="👤 Управление пользователями", callback_data="menu_users")])
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def get_docs_cats_keyboard():
     return InlineKeyboardMarkup(
@@ -201,7 +221,7 @@ async def command_start_handler(message: Message) -> None:
 async def handle_menu_command(message: Message) -> None:
     await message.answer(
         get_menu_text(),
-        reply_markup=get_inline_menu_keyboard()
+        reply_markup=get_inline_menu_keyboard(message.from_user.id)
     )
 
 @dp.callback_query(F.data == "menu_docs_cats")
@@ -215,12 +235,71 @@ async def callback_menu_docs_cats(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "menu_back")
 async def callback_menu_back(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.message.edit_text(
-        await state.clear(),
-            get_menu_text(),
-            reply_markup=get_inline_menu_keyboard()
+        get_menu_text(),
+        reply_markup=get_inline_menu_keyboard(callback.from_user.id)
     )
     await callback.answer()
+
+@dp.callback_query(F.data == "menu_users")
+async def callback_menu_users(callback: CallbackQuery):
+    users = get_all_users()
+    text = f"<b>Управление пользователями</b>\n\n"
+    if users:
+        text += "Текущие пользователи:\n" + "\n".join([f"• <code>{uid}</code>" for uid in users])
+    else:
+        text += "Список зарегистрированных пользователей пуст."
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data="user_add"),
+            InlineKeyboardButton(text="➖ Удалить", callback_data="user_remove")
+        ],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "user_add")
+async def callback_user_add(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserManagementState.waiting_for_add_id)
+    await callback.message.edit_text("Отправьте ID пользователя или перешлите сообщение от него в чат со мной.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_users")]]))
+    await callback.answer()
+
+@dp.callback_query(F.data == "user_remove")
+async def callback_user_remove(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserManagementState.waiting_for_remove_id)
+    await callback.message.edit_text("Отправьте ID пользователя или перешлите сообщение от него в чат со мной для удаления.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_users")]]))
+    await callback.answer()
+
+@dp.message(UserManagementState.waiting_for_add_id or UserManagementState.waiting_for_remove_id)
+async def handle_user_id(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    user_id_to_process = None
+
+    if message.forward_from:
+        user_id_to_process = message.forward_from.id
+    elif message.text and message.text.strip().isdigit():
+        user_id_to_process = int(message.text.strip())
+    else:
+        await message.answer("Неверный формат. Пожалуйста, отправьте числовой ID или перешлите сообщение.")
+        return
+
+    confirmation_text = ""
+    if current_state == UserManagementState.waiting_for_add_id.state:
+        if add_user(user_id_to_process):
+            confirmation_text = f"✅ Пользователь <code>{user_id_to_process}</code> успешно добавлен."
+        else:
+            confirmation_text = f"⚠️ Пользователь <code>{user_id_to_process}</code> уже был в списке."
+    elif current_state == UserManagementState.waiting_for_remove_id.state:
+        if remove_user(user_id_to_process):
+            confirmation_text = f"✅ Пользователь <code>{user_id_to_process}</code> успешно удален."
+        else:
+            confirmation_text = f"⚠️ Пользователь <code>{user_id_to_process}</code> не найден в списке."
+    
+    await state.clear()
+    await message.answer(confirmation_text)
 
 @dp.callback_query(F.data.startswith("docs_list_") | (F.data == "docs_cat_list"))
 async def callback_docs_cat_list(callback: CallbackQuery):
@@ -944,6 +1023,28 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     os.remove(out_path)
     await msg.delete()
 
+class AuthMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[types.TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: types.TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        # Если админ не задан, разрешаем всем
+        if not ADMIN_USER_ID:
+            return await handler(event, data)
+
+        user = data.get('event_from_user')
+        if not user:
+            return await handler(event, data)
+
+        # Разрешаем админу и зарегистрированным пользователям
+        if user.id == ADMIN_USER_ID or is_user_allowed(user.id):
+            return await handler(event, data)
+        
+        # Остальным не отвечаем
+        return
+
 async def main() -> None:
     if not TOKEN:
         print("ОШИБКА: Задайте TELEGRAM_BOT_TOKEN перед запуском бота.")
@@ -951,6 +1052,9 @@ async def main() -> None:
         
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     
+    # Регистрируем middleware для всех апдейтов
+    dp.update.middleware(AuthMiddleware())
+
     # Настраиваем только ОДНУ команду в меню, чтобы пользователь не видел список слеш-команд
     await bot.set_my_commands([
         BotCommand(command="menu", description="Открыть главное меню")

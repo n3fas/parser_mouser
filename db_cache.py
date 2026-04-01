@@ -40,7 +40,42 @@ def _get_connection():
         "name TEXT PRIMARY KEY"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS allowed_users ("
+        "user_id INTEGER PRIMARY KEY"
+        ")"
+    )
     return conn
+
+def add_user(user_id: int) -> bool:
+    with _db_lock:
+        with _get_connection() as conn:
+            try:
+                conn.execute("INSERT INTO allowed_users (user_id) VALUES (?)", (user_id,))
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+def remove_user(user_id: int) -> bool:
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+            return cursor.rowcount > 0
+
+def is_user_allowed(user_id: int) -> bool:
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
+            return cursor.fetchone() is not None
+
+def get_all_users() -> list[int]:
+    with _db_lock:
+        with _get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM allowed_users ORDER BY user_id")
+            return [r[0] for r in cursor.fetchall()]
 
 def clear_ip_brands():
     with _db_lock:
