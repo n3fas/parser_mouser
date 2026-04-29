@@ -20,7 +20,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from openpyxl import load_workbook, Workbook
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from typing import Callable, Dict, Any, Awaitable
+from typing import Callable, Dict, Any, Awaitable, Optional
+from aiogram.client.session.aiohttp import AiohttpSession
+
+import aiohttp
+try:
+    from aiohttp_socks import ProxyConnector
+except ImportError:
+    ProxyConnector = None
 
 class UpdateState(StatesGroup):
     waiting_for_data = State()
@@ -58,6 +65,7 @@ load_dotenv(find_dotenv(), override=False)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+PROXY_URL = os.getenv("TELEGRAM_PROXY")
 if not TOKEN:
     logger.warning("Переменная TELEGRAM_BOT_TOKEN не задана в .env файле.")
 
@@ -513,10 +521,60 @@ class AuthMiddleware(BaseMiddleware):
         if not user or user.id == ADMIN_USER_ID or is_user_allowed(user.id): return await handler(event, data)
         if isinstance(event, types.Message) and event.chat.type == "private": await event.answer(f"⛔ Доступ ограничен. ID: {user.id}")
 
-async def main() -> None:
-    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp.update.middleware(AuthMiddleware())
-    await bot.set_my_commands([BotCommand(command="menu", description="📱 Меню"), BotCommand(command="history", description="🕒 История"), BotCommand(command="stats", description="📊 База")])
-    logger.info("Бот запущен."); await dp.start_polling(bot)
+class CustomProxySession(AiohttpSession):
+    def __init__(self, proxy_url: str, **kwargs):
+        super().__init__(**kwargs)
+        self.proxy_url = proxy_url
 
-if __name__ == "__main__": asyncio.run(main())
+    async def create_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            if ProxyConnector:
+                connector = ProxyConnector.from_url(self.proxy_url)
+                self._session = aiohttp.ClientSession(connector=connector)
+            else:
+                logger.error("Библиотека aiohttp-socks не установлена! Прокси не будет работать.")
+                self._session = aiohttp.ClientSession()
+        return self._session
+
+async def main() -> None:
+    # Инициализируем сессию: через прокси или обычную
+    if PROXY_URL:
+        logger.info(f"Используется прокси: {PROXY_URL}")
+        session = CustomProxySession(proxy_url=PROXY_URL)
+    else:
+        session = AiohttpSession()
+    
+    bot = Bot(
+        token=TOKEN, 
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    
+    dp.update.middleware(AuthMiddleware())
+    
+    # Команды ставим через try, чтобы не вешать запуск
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="menu", description="📱 Меню"), 
+            BotCommand(command="history", description="🕒 История"), 
+            BotCommand(command="stats", description="📊 База")
+        ])
+    except: pass
+
+    logger.info("Бот запущен. Начинаю polling...")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    # Фикс для Windows: SelectorEventLoop часто стабильнее на капризных сетевых драйверах
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
