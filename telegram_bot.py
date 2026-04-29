@@ -28,10 +28,12 @@ class UpdateState(StatesGroup):
 class DocsCategoryState(StatesGroup):
     waiting_for_add = State()
     waiting_for_remove = State()
+    waiting_for_search = State()
 
 class LabelingCategoryState(StatesGroup):
     waiting_for_add = State()
     waiting_for_remove = State()
+    waiting_for_search = State()
 
 class IPRegistryState(StatesGroup):
     waiting_for_file = State()
@@ -41,7 +43,7 @@ class UserManagementState(StatesGroup):
     waiting_for_remove_id = State()
 
 # Импортируем готовые функции из нашего проекта
-from mouser_cli import _get_api_key, write_xlsx, _translate_to_ru
+from mouser_cli import _get_api_key, write_xlsx, enrich_xlsx, _translate_to_ru
 from mouser_menu import _lookup_one, _split_pns
 from db_cache import (
     add_to_history, get_user_history, clear_user_history, 
@@ -59,23 +61,14 @@ ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 if not TOKEN:
     logger.warning("Переменная TELEGRAM_BOT_TOKEN не задана в .env файле.")
 
-# Опциональная настройка для ограничения работы бота конкретным топиком в группе
 ALLOWED_THREAD_ID = os.getenv("ALLOWED_THREAD_ID")
 if ALLOWED_THREAD_ID:
-    try:
-        ALLOWED_THREAD_ID = int(ALLOWED_THREAD_ID)
-    except ValueError:
-        logger.warning("ALLOWED_THREAD_ID должен быть числом.")
-        ALLOWED_THREAD_ID = None
+    try: ALLOWED_THREAD_ID = int(ALLOWED_THREAD_ID)
+    except ValueError: logger.warning("ALLOWED_THREAD_ID должен быть числом.")
 
 if ADMIN_USER_ID:
-    try:
-        ADMIN_USER_ID = int(ADMIN_USER_ID)
-    except ValueError:
-        logger.warning("ADMIN_USER_ID должен быть числом.")
-        ADMIN_USER_ID = None
-else:
-    logger.warning("ADMIN_USER_ID не задан. Бот будет доступен всем.")
+    try: ADMIN_USER_ID = int(ADMIN_USER_ID)
+    except ValueError: logger.warning("ADMIN_USER_ID должен быть числом.")
 
 dp = Dispatcher()
 
@@ -100,973 +93,430 @@ def get_inline_menu_keyboard(user_id: int):
         [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="menu_clear_history")]
     ]
     if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
-        # Вставляем кнопку управления пользователями на 3-ю позицию
         kb.insert(2, [InlineKeyboardButton(text="👤 Управление пользователями", callback_data="menu_users")])
-
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def get_docs_cats_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить", callback_data="docs_cat_add")],
-            [InlineKeyboardButton(text="➖ Удалить", callback_data="docs_cat_remove")],
-            [InlineKeyboardButton(text="📜 Список", callback_data="docs_cat_list")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить", callback_data="docs_cat_add")],
+        [InlineKeyboardButton(text="➖ Удалить", callback_data="docs_cat_remove")],
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="docs_cat_search")],
+        [InlineKeyboardButton(text="📜 Список", callback_data="docs_cat_list")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
+    ])
 
 def get_labeling_cats_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить", callback_data="labeling_cat_add")],
-            [InlineKeyboardButton(text="➖ Удалить", callback_data="labeling_cat_remove")],
-            [InlineKeyboardButton(text="📜 Список", callback_data="labeling_cat_list")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить", callback_data="labeling_cat_add")],
+        [InlineKeyboardButton(text="➖ Удалить", callback_data="labeling_cat_remove")],
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="labeling_cat_search")],
+        [InlineKeyboardButton(text="📜 Список", callback_data="labeling_cat_list")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
+    ])
 
-# Храним последние запрошенные партномера для генерации Excel по кнопке
 _user_last_pns = {}
 
 def process_pns_sync(pns, api_key, force_update=False):
-    """Синхронная функция обработки списка партномеров для запуска в отдельном потоке"""
     results = []
     for pn in pns:
-        row = _lookup_one(pn, api_key, retries=3, timeout=20, save_raw_dir=None, force_update=force_update)
-        if row:
-            results.append(row)
+        row = _lookup_one(pn, api_key, force_update=force_update)
+        if row: results.append(row)
     return results
 
 def extract_pns_from_excel_sync(filepath):
-    """Извлекает партномера и бренды из Excel файла"""
     try:
-        wb = load_workbook(filepath, data_only=True)
-        ws = wb.active
-    except Exception as e:
-        return None, f"Ошибка чтения Excel: {e}. Попробуйте сохранить его в новом формате \" .xlsx \"."
-
-    part_col_idx = None
-    brand_col_idx = None
-    start_row = None
-
-    pn_col_names = ("partno", "partnumber", "partnum", "pn", "p/n")
-    brand_col_names = ("brand", "mfr", "mark", "manufacturer")
-
-    for row_idx, row in enumerate(ws.iter_rows(max_row=50), start=1):
-        for col_idx, cell in enumerate(row, start=1):
+        wb = load_workbook(filepath, data_only=True); ws = wb.active
+    except Exception as e: return None, f"Ошибка: {e}"
+    part_col_idx = None; brand_col_idx = None; start_row = None
+    pn_names = ("partno", "partnumber", "partnum", "pn", "p/n")
+    br_names = ("brand", "mfr", "mark", "manufacturer")
+    for r_idx, row in enumerate(ws.iter_rows(max_row=50), 1):
+        for c_idx, cell in enumerate(row, 1):
             if cell.value and isinstance(cell.value, str):
-                val_clean = cell.value.strip().lower().replace(" ", "").replace(".", "")
-                if val_clean in pn_col_names and not part_col_idx:
-                    part_col_idx = col_idx
-                elif val_clean in brand_col_names and not brand_col_idx:
-                    brand_col_idx = col_idx
-        
-        if part_col_idx: # If we found the main column, we can assume the header row is this one.
-            start_row = row_idx + 1
-            break
-
-    if not part_col_idx:
-        return None, "NO_COLUMN"
-
-    parts_data = []
-    for row_idx in range(start_row, ws.max_row + 1):
-        pn_val = ws.cell(row=row_idx, column=part_col_idx).value
-        if pn_val is None or str(pn_val).strip() == "":
-            break
-        
-        brand_val = None
-        if brand_col_idx:
-            brand_val = ws.cell(row=row_idx, column=brand_col_idx).value
-        
-        parts_data.append({
-            "pn": str(pn_val).strip(),
-            "brand": str(brand_val).strip() if brand_val else None
-        })
-
-    if not parts_data:
-        return None, "Список парт-номеров пуст."
-
-    return parts_data, None
+                v = cell.value.strip().lower().replace(" ", "").replace(".", "")
+                if v in pn_names and not part_col_idx: part_col_idx = c_idx
+                elif v in br_names and not brand_col_idx: brand_col_idx = c_idx
+        if part_col_idx: start_row = r_idx + 1; break
+    if not part_col_idx: return None, "NO_COLUMN"
+    parts = []
+    for r_idx in range(start_row, ws.max_row + 1):
+        pn = ws.cell(row=r_idx, column=part_col_idx).value
+        if pn is None or str(pn).strip() == "": break
+        br = ws.cell(row=r_idx, column=brand_col_idx).value if brand_col_idx else None
+        parts.append({"pn": str(pn).strip(), "brand": str(br).strip() if br else None})
+    return parts, None
 
 def create_template_excel():
-    """Создает пустой шаблон Excel"""
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["Part no."])
-    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-    wb.save(tmp.name)
+    wb = Workbook(); ws = wb.active; ws.append(["Part no."])
+    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False); wb.save(tmp.name)
     return tmp.name
 
 def get_progress_bar(current, total, length=10):
-    percent = current / total
-    filled = int(length * percent)
-    bar = "⬛" * filled + "⬜" * (length - filled)
-    return f"{bar} ({int(percent * 100)}%)"
+    p = current / total if total > 0 else 0
+    f = int(length * p); bar = "⬛" * f + "⬜" * (length - f)
+    return f"{bar} ({int(p * 100)}%)"
 
 def translate_cats_sync(cats):
     res = []
     for c in cats:
         t = _translate_to_ru(c)
-        if t and t != c:
-            res.append(f"• <code>{c}</code> ({t})")
-        else:
-            res.append(f"• <code>{c}</code>")
+        res.append(f"• <code>{c}</code> ({t})" if t and t != c else f"• <code>{c}</code>")
     return res
 
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
-    await message.answer(
-        "Привет! Я готов к работе. Нажмите кнопку «Меню» (слева от поля ввода текста), чтобы узнать, что я умею.",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await message.answer("Привет! Нажмите «Меню» для начала.", reply_markup=ReplyKeyboardRemove())
 
 @dp.message(Command("menu"))
 async def handle_menu_command(message: Message) -> None:
-    await message.answer(
-        get_menu_text(),
-        reply_markup=get_inline_menu_keyboard(message.from_user.id)
-    )
+    await message.answer(get_menu_text(), reply_markup=get_inline_menu_keyboard(message.from_user.id))
 
 @dp.callback_query(F.data == "menu_docs_cats")
 async def callback_menu_docs_cats(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "📋 <b>Управление категориями для разрешительных документов</b>\n\n"
-        "Детали из этих категорий будут выделяться <b>бледно-желтым цветом</b> в Excel-отчетах.",
-        reply_markup=get_docs_cats_keyboard()
-    )
+    await callback.message.edit_text("📋 <b>Категории для доков</b>\n(бледно-желтый в Excel)", reply_markup=get_docs_cats_keyboard())
     await callback.answer()
 
 @dp.callback_query(F.data == "menu_back")
 async def callback_menu_back(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text(
-        get_menu_text(),
-        reply_markup=get_inline_menu_keyboard(callback.from_user.id)
-    )
+    await state.clear(); await callback.message.edit_text(get_menu_text(), reply_markup=get_inline_menu_keyboard(callback.from_user.id))
     await callback.answer()
 
 @dp.callback_query(F.data == "menu_users")
 async def callback_menu_users(callback: CallbackQuery):
     users = get_all_users()
-    text = f"<b>Управление пользователями</b>\n\n"
-    if users:
-        text += "Текущие пользователи:\n" + "\n".join([f"• <code>{uid}</code>" for uid in users])
-    else:
-        text += "Список зарегистрированных пользователей пуст."
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Добавить", callback_data="user_add"),
-            InlineKeyboardButton(text="➖ Удалить", callback_data="user_remove")
-        ],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb)
+    text = f"👤 <b>Пользователи:</b>\n\n" + ("\n".join([f"• <code>{u}</code>" for u in users]) if users else "Пусто.")
+    kb = [[InlineKeyboardButton(text="➕", callback_data="user_add"), InlineKeyboardButton(text="➖", callback_data="user_remove")], [InlineKeyboardButton(text="🔙", callback_data="menu_back")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await callback.answer()
 
 @dp.callback_query(F.data == "user_add")
 async def callback_user_add(callback: CallbackQuery, state: FSMContext):
     await state.set_state(UserManagementState.waiting_for_add_id)
-    await callback.message.edit_text("Отправьте ID пользователя или перешлите сообщение от него в чат со мной.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_users")]]))
+    await callback.message.answer("ID пользователя?")
     await callback.answer()
 
 @dp.callback_query(F.data == "user_remove")
 async def callback_user_remove(callback: CallbackQuery, state: FSMContext):
     await state.set_state(UserManagementState.waiting_for_remove_id)
-    await callback.message.edit_text("Отправьте ID пользователя или перешлите сообщение от него в чат со мной для удаления.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_users")]]))
+    await callback.message.answer("ID для удаления?")
     await callback.answer()
 
-@dp.message(UserManagementState.waiting_for_add_id or UserManagementState.waiting_for_remove_id)
-async def handle_user_id(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    user_id_to_process = None
+@dp.message(UserManagementState.waiting_for_add_id)
+async def handle_user_add(message: Message, state: FSMContext):
+    uid = message.forward_from.id if message.forward_from else (int(message.text) if message.text.isdigit() else None)
+    if uid and add_user(uid): await message.answer(f"✅ {uid} добавлен."); await state.clear()
+    else: await message.answer("Ошибка.")
 
-    if message.forward_from:
-        user_id_to_process = message.forward_from.id
-    elif message.text and message.text.strip().isdigit():
-        user_id_to_process = int(message.text.strip())
-    else:
-        await message.answer("Неверный формат. Пожалуйста, отправьте числовой ID или перешлите сообщение.")
-        return
-
-    confirmation_text = ""
-    if current_state == UserManagementState.waiting_for_add_id.state:
-        if add_user(user_id_to_process):
-            confirmation_text = f"✅ Пользователь <code>{user_id_to_process}</code> успешно добавлен."
-        else:
-            confirmation_text = f"⚠️ Пользователь <code>{user_id_to_process}</code> уже был в списке."
-    elif current_state == UserManagementState.waiting_for_remove_id.state:
-        if remove_user(user_id_to_process):
-            confirmation_text = f"✅ Пользователь <code>{user_id_to_process}</code> успешно удален."
-        else:
-            confirmation_text = f"⚠️ Пользователь <code>{user_id_to_process}</code> не найден в списке."
-    
-    await state.clear()
-    await message.answer(confirmation_text)
+@dp.message(UserManagementState.waiting_for_remove_id)
+async def handle_user_remove(message: Message, state: FSMContext):
+    uid = int(message.text) if message.text.isdigit() else None
+    if uid and remove_user(uid): await message.answer(f"✅ {uid} удален."); await state.clear()
+    else: await message.answer("Ошибка.")
 
 @dp.callback_query(F.data.startswith("docs_list_") | (F.data == "docs_cat_list"))
 async def callback_docs_cat_list(callback: CallbackQuery):
     page = 0 if callback.data == "docs_cat_list" else int(callback.data.split("_")[2])
-    limit = 20
-    offset = page * limit
-    total = get_docs_categories_count()
-    cats = get_docs_categories(limit=limit, offset=offset)
-    
-    if not cats and total == 0:
-        await callback.message.edit_text("Список категорий пуст.", reply_markup=get_docs_cats_keyboard())
-        await callback.answer()
-        return
-
-    cats_text_list = await asyncio.to_thread(translate_cats_sync, cats)
-    text = f"📜 <b>Категории с обязательными документами (страница {page+1} из {math.ceil(total/limit) if total > 0 else 1}):</b>\n\n"
-    text += "\n".join(cats_text_list)
-    
+    total = get_docs_categories_count(); cats = get_docs_categories(limit=20, offset=page*20)
+    text = f"📜 <b>Доки ({page+1}):</b>\n\n" + "\n".join(await asyncio.to_thread(translate_cats_sync, cats))
     kb = []
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"docs_list_{page-1}"))
-    if offset + limit < total:
-        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"docs_list_{page+1}"))
-    if nav_row:
-        kb.append(nav_row)
-    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_docs_cats")])
-    
-    markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    await callback.message.edit_text(text, reply_markup=markup)
+    if page > 0: kb.append(InlineKeyboardButton(text="⬅️", callback_data=f"docs_list_{page-1}"))
+    if (page+1)*20 < total: kb.append(InlineKeyboardButton(text="➡️", callback_data=f"docs_list_{page+1}"))
+    markup = [kb, [InlineKeyboardButton(text="🔙", callback_data="menu_docs_cats")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=markup))
     await callback.answer()
-
-@dp.callback_query(F.data == "docs_cat_add")
-async def callback_docs_cat_add(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(DocsCategoryState.waiting_for_add)
-    await callback.message.answer("Введите название категории (как она пишется в отчетах), которую нужно ДОБАВИТЬ:")
-    await callback.answer()
-
-@dp.callback_query(F.data == "docs_cat_remove")
-async def callback_docs_cat_remove(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(DocsCategoryState.waiting_for_remove)
-    await callback.message.answer("Введите название категории, которую нужно УДАЛИТЬ из списка:")
-    await callback.answer()
-
-@dp.message(DocsCategoryState.waiting_for_add)
-async def handle_docs_cat_add(message: Message, state: FSMContext):
-    # Если прислали файл вместо текста
-    if message.document:
-        doc = message.document
-        if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
-            await message.answer("Пожалуйста, отправьте список категорий текстом (каждая с новой строки) или файлом .xlsx")
-            return
-
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            input_path = tmp.name
-        await message.bot.download(doc, destination=input_path)
-
-        try:
-            wb = load_workbook(input_path, data_only=True)
-            ws = wb.active
-            count = 0
-            for row in ws.iter_rows(min_row=1, max_col=1):
-                val = row[0].value
-                if val and str(val).strip():
-                    if add_docs_category(str(val).strip()):
-                        count += 1
-            await message.answer(f"✅ Импорт завершен! Добавлено <b>{count}</b> новых категорий из файла.")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка импорта: {e}")
-        finally:
-            os.remove(input_path)
-            await state.clear()
-        return
-
-    # Обработка текстового ввода (можно несколько строк)
-    lines = [line.strip() for line in message.text.split('\n') if line.strip()]
-    if not lines:
-        await message.answer("Пустой ввод.")
-        return
-
-    added = 0
-    for cat_name in lines:
-        if add_docs_category(cat_name):
-            added += 1
-
-    if len(lines) == 1:
-        if added:
-            await message.answer(f"✅ Категория «<code>{lines[0]}</code>» добавлена.")
-        else:
-            await message.answer(f"⚠️ Категория «<code>{lines[0]}</code>» уже есть в списке.")
-    else:
-        await message.answer(f"✅ Обработано {len(lines)} строк. Добавлено новых категорий: <b>{added}</b>.")
-
-    await state.clear()
-
-@dp.message(DocsCategoryState.waiting_for_remove)
-async def handle_docs_cat_remove(message: Message, state: FSMContext):
-    cat_name = message.text.strip()
-    if remove_docs_category(cat_name):
-        await message.answer(f"✅ Категория «<code>{cat_name}</code>» удалена из списка.")
-    else:
-        await message.answer(f"⚠️ Категория не найдена в списке.")
-    await state.clear()
-
-@dp.message(Command("history"))
-async def handle_history_command(message: Message):
-    history = get_user_history(message.from_user.id)
-    if not history:
-        await message.answer("Ваша история запросов пуста.")
-        return
-        
-    text = "🕒 <b>Ваша история последних запросов (до 50 шт):</b>\n\n"
-    text += "\n".join([f"• <code>{pn}</code>" for pn in history])
-    
-    if len(text) > 4000:
-        for i in range(0, len(text), 4000):
-            await message.answer(text[i:i+4000])
-    else:
-        await message.answer(text)
 
 @dp.message(Command("stats"))
 async def handle_stats_command(message: Message):
     count = get_cache_stats()
-    await message.answer(f"📊 <b>Статистика базы данных:</b>\n\nВ локальном кэше сохранено деталей: <b>{count}</b>")
+    text = (
+        f"📊 <b>Статистика базы:</b>\n\n"
+        f"• Деталей в кэше: {count}\n"
+        f"• Разр. документы (категории): {get_docs_categories_count()}\n"
+        f"• Маркировка (категории): {get_labeling_categories_count()}\n"
+        f"• ТРОИС (брендов): {get_ip_brands_count()}\n"
+        f"• Пользователей: {len(get_all_users())}"
+    )
+    await message.answer(text)
+
+@dp.callback_query(F.data == "menu_stats")
+async def callback_menu_stats(callback: CallbackQuery):
+    count = get_cache_stats()
+    text = (
+        f"📊 <b>Статистика базы:</b>\n\n"
+        f"• Деталей в кэше: {count}\n"
+        f"• Разр. документы (категории): {get_docs_categories_count()}\n"
+        f"• Маркировка (категории): {get_labeling_categories_count()}\n"
+        f"• ТРОИС (брендов): {get_ip_brands_count()}\n"
+        f"• Пользователей: {len(get_all_users())}"
+    )
+    kb = [[InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.message(Command("history"))
+async def handle_history_command(message: Message):
+    history = get_user_history(message.from_user.id)
+    if not history: await message.answer("История пуста."); return
+    text = "🕒 <b>Последние 20 запросов:</b>\n\n" + "\n".join([f"• <code>{pn}</code>" for pn in history])
+    await message.answer(text)
+
+@dp.callback_query(F.data == "menu_history")
+async def callback_menu_history(callback: CallbackQuery):
+    history = get_user_history(callback.from_user.id)
+    text = "🕒 <b>Последние 20 запросов:</b>\n\n" + ("\n".join([f"• <code>{pn}</code>" for pn in history]) if history else "История пуста.")
+    kb = [[InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.message(Command("clear_history"))
+async def handle_clear_history_command(message: Message):
+    clear_user_history(message.from_user.id); await message.answer("✅ История очищена.")
+
+@dp.callback_query(F.data == "menu_clear_history")
+async def callback_menu_clear_history(callback: CallbackQuery):
+    clear_user_history(callback.from_user.id); await callback.answer("История очищена!")
+    await callback_menu_back(callback, None)
+
+@dp.callback_query(F.data == "docs_cat_add")
+async def callback_docs_cat_add(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DocsCategoryState.waiting_for_add); await callback.message.answer("Категория (текст или файл)?"); await callback.answer()
+
+@dp.callback_query(F.data == "docs_cat_remove")
+async def callback_docs_cat_remove(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DocsCategoryState.waiting_for_remove); await callback.message.answer("Категория для удаления?"); await callback.answer()
+
+@dp.message(DocsCategoryState.waiting_for_add)
+async def handle_docs_cat_add(message: Message, state: FSMContext):
+    if message.document: return await handle_document(message, message.bot, state)
+    lines = [l.strip() for l in message.text.split('\n') if l.strip()]
+    added = sum(1 for c in lines if add_docs_category(c))
+    await message.answer(f"✅ Добавлено: {added}"); await state.clear()
+
+@dp.message(DocsCategoryState.waiting_for_remove)
+async def handle_docs_cat_remove(message: Message, state: FSMContext):
+    if remove_docs_category(message.text.strip()): await message.answer("✅ Удалено.")
+    else: await message.answer("⚠️ Не найдено."); await state.clear()
 
 @dp.callback_query(F.data == "menu_labeling_cats")
 async def callback_menu_labeling_cats(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🏷 <b>Управление категориями для маркировки</b>\n\n"
-        "Детали из этих категорий будут выделяться <b>бледно-зеленым цветом</b> в Excel-отчетах.",
-        reply_markup=get_labeling_cats_keyboard()
-    )
+    await callback.message.edit_text("🏷 <b>Категории для маркировки</b>\n(бледно-зеленый в Excel)", reply_markup=get_labeling_cats_keyboard())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("labeling_list_") | (F.data == "labeling_cat_list"))
 async def callback_labeling_cat_list(callback: CallbackQuery):
     page = 0 if callback.data == "labeling_cat_list" else int(callback.data.split("_")[2])
-    limit = 20
-    offset = page * limit
-    total = get_labeling_categories_count()
-    cats = get_labeling_categories(limit=limit, offset=offset)
-    
-    if not cats and total == 0:
-        await callback.message.edit_text("Список категорий маркировки пуст.", reply_markup=get_labeling_cats_keyboard())
-        await callback.answer()
-        return
-
-    cats_text_list = await asyncio.to_thread(translate_cats_sync, cats)
-    text = f"📜 <b>Категории товаров подлежащих маркировке (страница {page+1} из {math.ceil(total/limit) if total > 0 else 1}):</b>\n\n"
-    text += "\n".join(cats_text_list)
-    
+    total = get_labeling_categories_count(); cats = get_labeling_categories(limit=20, offset=page*20)
+    text = f"📜 <b>Маркировка ({page+1}):</b>\n\n" + "\n".join(await asyncio.to_thread(translate_cats_sync, cats))
     kb = []
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"labeling_list_{page-1}"))
-    if offset + limit < total:
-        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"labeling_list_{page+1}"))
-    if nav_row:
-        kb.append(nav_row)
-    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_labeling_cats")])
-    
-    markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    await callback.message.edit_text(text, reply_markup=markup)
+    if page > 0: kb.append(InlineKeyboardButton(text="⬅️", callback_data=f"labeling_list_{page-1}"))
+    if (page+1)*20 < total: kb.append(InlineKeyboardButton(text="➡️", callback_data=f"labeling_list_{page+1}"))
+    markup = [kb, [InlineKeyboardButton(text="🔙", callback_data="menu_labeling_cats")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=markup))
     await callback.answer()
 
 @dp.callback_query(F.data == "labeling_cat_add")
 async def callback_labeling_cat_add(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(LabelingCategoryState.waiting_for_add)
-    await callback.message.answer("Введите название категории маркировки (текстом или файлом Excel):")
-    await callback.answer()
+    await state.set_state(LabelingCategoryState.waiting_for_add); await callback.message.answer("Категория (текст или файл)?"); await callback.answer()
 
 @dp.callback_query(F.data == "labeling_cat_remove")
 async def callback_labeling_cat_remove(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(LabelingCategoryState.waiting_for_remove)
-    await callback.message.answer("Введите название категории маркировки для УДАЛЕНИЯ:")
-    await callback.answer()
+    await state.set_state(LabelingCategoryState.waiting_for_remove); await callback.message.answer("Категория для удаления?"); await callback.answer()
 
 @dp.message(LabelingCategoryState.waiting_for_add)
 async def handle_labeling_cat_add(message: Message, state: FSMContext):
-    if message.document:
-        # Реиспользуем логику импорта из Excel для маркировки
-        doc = message.document
-        if not doc.file_name.lower().endswith(('.xlsx', '.xls')):
-            await message.answer("Отправьте Excel файл .xlsx")
-            return
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            input_path = tmp.name
-        await message.bot.download(doc, destination=input_path)
-        try:
-            wb = load_workbook(input_path, data_only=True)
-            ws = wb.active
-            count = 0
-            for row in ws.iter_rows(min_row=1, max_col=1):
-                val = row[0].value
-                if val and str(val).strip():
-                    if add_labeling_category(str(val).strip()):
-                        count += 1
-            await message.answer(f"✅ Импорт завершен! Добавлено <b>{count}</b> категорий маркировки.")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка: {e}")
-        finally:
-            os.remove(input_path)
-            await state.clear()
-        return
-
-    lines = [line.strip() for line in message.text.split('\n') if line.strip()]
-    added = 0
-    for cat in lines:
-        if add_labeling_category(cat):
-            added += 1
-    await message.answer(f"✅ Добавлено категорий маркировки: <b>{added}</b>.")
-    await state.clear()
+    if message.document: return await handle_document(message, message.bot, state)
+    lines = [l.strip() for l in message.text.split('\n') if l.strip()]
+    added = sum(1 for c in lines if add_labeling_category(c))
+    await message.answer(f"✅ Добавлено: {added}"); await state.clear()
 
 @dp.message(LabelingCategoryState.waiting_for_remove)
 async def handle_labeling_cat_remove(message: Message, state: FSMContext):
-    cat_name = message.text.strip()
-    if remove_labeling_category(cat_name):
-        await message.answer(f"✅ Категория маркировки «<code>{cat_name}</code>» удалена.")
-    else:
-        await message.answer(f"⚠️ Категория не найдена.")
-    await state.clear()
+    if remove_labeling_category(message.text.strip()): await message.answer("✅ Удалено.")
+    else: await message.answer("⚠️ Не найдено."); await state.clear()
 
 @dp.callback_query(F.data == "menu_update")
 async def callback_menu_update(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(UpdateState.waiting_for_data)
-    await callback.message.answer(
-        "🔄 <b>Режим актуализации</b>\n\n"
-        "Отправьте мне парт-номера текстом или Excel-файл. "
-        "Я проигнорирую локальную базу и скачаю самые свежие данные с сайта Mouser."
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "menu_update_all")
-async def callback_menu_update_all(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "⚠️ <b>Внимание!</b>\n\n"
-        "Полная актуализация проверит все сохраненные детали в базе данных "
-        "и обновит их информацию с сайта Mouser.\n\n"
-        "Это может занять длительное время и потратить лимиты API. Вы уверены?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, начать", callback_data="start_update_all")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_back")]
-        ])
-    )
-    await callback.answer()
-
-async def run_full_update(message: Message, pns: list):
-    try:
-        api_key = _get_api_key()
-    except SystemExit:
-        await message.answer("Ошибка: MOUSER_API_KEY не настроен на сервере.")
-        return
-
-    total = len(pns)
-    processed = 0
-    last_update_time = asyncio.get_event_loop().time()
-    
-    for pn in pns:
-        await asyncio.to_thread(_lookup_one, pn, api_key, 3, 20, None, True)
-        processed += 1
-        
-        current_time = asyncio.get_event_loop().time()
-        if current_time - last_update_time > 3.0 or processed == total:
-            try:
-                await message.edit_text(
-                    f"⏳ Полная актуализация базы...\n\n"
-                    f"Обработано: {processed} / {total}\n"
-                    f"{get_progress_bar(processed, total)}"
-                )
-                last_update_time = current_time
-            except Exception:
-                pass
-                
-    try:
-        await message.edit_text(f"✅ Полная актуализация завершена!\nУспешно обновлено деталей: <b>{total}</b>.")
-    except Exception:
-        await message.answer(f"✅ Полная актуализация завершена!\nУспешно обновлено деталей: <b>{total}</b>.")
+    await state.set_state(UpdateState.waiting_for_data); await callback.message.answer("🔄 Пришлите PN или Excel (обновление)..."); await callback.answer()
 
 @dp.callback_query(F.data == "start_update_all")
 async def callback_start_update_all(callback: CallbackQuery):
     pns = get_all_cached_pns()
-    if not pns:
-        await callback.answer("База данных пуста.", show_alert=True)
-        return
-    
-    await callback.message.edit_text(f"⏳ Начинаю полную актуализацию {len(pns)} деталей...\nЭто может занять много времени.")
-    asyncio.create_task(run_full_update(callback.message, pns))
-    await callback.answer()
+    if not pns: await callback.answer("Пусто."); return
+    await callback.message.edit_text(f"⏳ Обновляю {len(pns)} деталей..."); asyncio.create_task(run_full_update(callback.message, pns)); await callback.answer()
+
+async def run_full_update(message: Message, pns: list):
+    try: api_key = _get_api_key()
+    except: await message.answer("Ключ не найден."); return
+    total = len(pns); processed = 0; last_t = asyncio.get_event_loop().time()
+    for pn in pns:
+        await asyncio.to_thread(_lookup_one, pn, api_key, force_update=True); processed += 1
+        now = asyncio.get_event_loop().time()
+        if now - last_t > 3.0 or processed == total:
+            try: await message.edit_text(f"⏳ {processed}/{total}\n{get_progress_bar(processed, total)}"); last_t = now
+            except: pass
+    await message.answer(f"✅ Готово: {total}.")
 
 @dp.callback_query(F.data == "menu_ip_registry")
 async def callback_menu_ip_registry(callback: CallbackQuery, state: FSMContext):
-    count = get_ip_brands_count()
     await state.set_state(IPRegistryState.waiting_for_file)
-    await callback.message.edit_text(
-        f"🛡 <b>Реестр ТРОИС (Интеллектуалка)</b>\n\n"
-        f"В базе сейчас активных марок: <b>{count}</b>\n\n"
-        "Отправьте Excel-файл с реестром для <b>обновления</b> базы или выгрузите текущий список.\n\n"
-        "• Столбец A: Рег. номер (напр. 00012/00001-012/ТЗ-130204)\n"
-        "• Столбец B: Марка товара\n"
-        "• Столбец E: Дата окончания срока (учитываются даты ≥ сегодня)\n\n"
-        "<i>Внимание: при загрузке нового файла старая база будет очищена!</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Выгрузить текущий список", callback_data="export_ip_brands")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]
-        ])
-    )
+    await callback.message.edit_text(f"🛡 <b>ТРОИС</b> (брендов: {get_ip_brands_count()})\n\nПришлите файл для обновления.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Выгрузить", callback_data="export_ip_brands")], [InlineKeyboardButton(text="🔙", callback_data="menu_back")]]))
     await callback.answer()
 
 @dp.callback_query(F.data == "export_ip_brands")
-async def callback_export_ip_brands(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    
-    brands = await asyncio.to_thread(get_all_ip_brands)
-    
-    if not brands:
-        await callback.answer("База брендов ТРОИС пуста.", show_alert=True)
-        return
-
-    msg = await callback.message.answer("⏳ Формирую Excel-файл...")
-
-    def write_brands_to_excel(brands_list, path):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "IP Brands"
-        ws.append(["Brand Name"])
-        for brand in brands_list:
-            ws.append([brand])
-        wb.save(path)
-
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        tmp_name = tmp.name
-        
-    await asyncio.to_thread(write_brands_to_excel, brands, tmp_name)
-
-    file = FSInputFile(tmp_name, filename="ip_brands_export.xlsx")
-    await callback.message.answer_document(file, caption=f"✅ Выгружено {len(brands)} брендов из реестра ТРОИС.")
-    os.remove(tmp_name)
-    await msg.delete()
-    await callback.answer()
-
-@dp.callback_query(F.data == "menu_history")
-async def callback_menu_history(callback: CallbackQuery):
-    await callback.answer()
-    history = get_user_history(callback.from_user.id)
-    if not history:
-        await callback.message.answer("Ваша история запросов пуста.")
-        return
-
-    text = "🕒 <b>Ваша история последних запросов (до 50 шт):</b>\n\n"
-    text += "\n".join([f"• <code>{pn}</code>" for pn in history])
-
-    # Разделяем длинный текст на части, если он больше 4000 символов
-    if len(text) > 4000:
-        for i in range(0, len(text), 4000):
-            await callback.message.answer(text[i:i+4000])
-    else:
-        await callback.message.answer(text)
-
-@dp.callback_query(F.data == "menu_stats")
-async def callback_menu_stats(callback: CallbackQuery):
-    count = get_cache_stats()
-    await callback.message.answer(f"📊 <b>Статистика базы данных:</b>\n\nВ локальном кэше сохранено деталей: <b>{count}</b>")
-    await callback.answer()
-
-@dp.callback_query(F.data == "menu_clear_history")
-async def callback_menu_clear_history(callback: CallbackQuery):
-    clear_user_history(callback.from_user.id)
-    await callback.answer("✅ Ваша история запросов очищена.", show_alert=True)
+async def callback_export_ip_brands(callback: CallbackQuery):
+    brands = get_all_ip_brands()
+    if not brands: await callback.answer("Пусто."); return
+    msg = await callback.message.answer("⏳ Формирую..."); tmp_path = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name
+    def write(b_list, p):
+        wb = Workbook(); ws = wb.active; ws.append(["Brand Name"])
+        for b in b_list: ws.append([b])
+        wb.save(p)
+    await asyncio.to_thread(write, brands, tmp_path)
+    await callback.message.answer_document(FSInputFile(tmp_path, filename="ip_brands.xlsx")); os.remove(tmp_path); await msg.delete()
 
 def format_text_result(results):
     lines = []
     for r in results:
         req_pn = r.get("Запрошенный партномер", "-")
-        mouser_pn = r.get("Партномер Mouser", "-")
-        mfr_pn = r.get("Партномер производителя", "-")
         mfr = r.get("Производитель", "-")
-        cat = r.get("Категория", "-")
+        cat_ru = r.get("Категория", "-")
         cat_en = r.get("Категория (EN)")
         desc = r.get("Описание", "-")
-        img = r.get("Ссылка на фото")
-        ds = r.get("Даташит")
-        cache_date = r.get("Дата кэширования")
-
-        lines.append(f"🔍 <b>{req_pn}</b>")
-        lines.append(f"Mouser PN: <code>{mouser_pn}</code>")
-        lines.append(f"Mfr. PN: <code>{mfr_pn}</code>")
-        lines.append(f"Производитель: {mfr}")
-        lines.append(f"Категория: {cat}")
-        
-        warnings = []
-        if cat_en and cat_en != "-":
-            if is_labeling_category(cat_en):
-                warnings.append("🟢 Требуется маркировка")
-            if is_docs_category(cat_en):
-                warnings.append("🟡 Нужны разрешительные документы")
-        
-        brand_from_excel = r.get("brand_from_excel")
-        is_ip = False
-        if brand_from_excel and is_ip_brand(brand_from_excel):
-            is_ip = True
-        elif mfr and mfr != "-" and is_ip_brand(mfr):
-            is_ip = True
-        
-        if is_ip:
-            warnings.append("⛔ Интеллектуальная собственность (ТРОИС)")
-            
-        if warnings:
-            lines.append("⚠️ <b>Внимание:</b> " + ", ".join(warnings))
+        ds = r.get("Даташит"); img = r.get("Ссылка на фото")
+        lines.append(f"🔍 <b>{req_pn}</b>\nПроизводитель: {mfr}\nКатегория: {cat_ru}")
+        warns = []
+        # Проверяем и английское, и русское название категории
+        for c_val in [cat_en, cat_ru]:
+            if c_val and c_val != "-":
+                if is_labeling_category(c_val) and "🟢 Маркировка" not in warns: warns.append("🟢 Маркировка")
+                if is_docs_category(c_val) and "🟡 Документы" not in warns: warns.append("🟡 Документы")
+        brand_excel = r.get("brand_from_excel")
+        if (brand_excel and is_ip_brand(brand_excel)) or (mfr and mfr != "-" and is_ip_brand(mfr)): warns.append("⛔ ТРОИС")
+        if warns: lines.append("⚠️ <b>Внимание:</b> " + ", ".join(warns))
         lines.append(f"Описание: {desc}")
-        if cache_date:
-            lines.append(f"<i>Взято из БД: {cache_date}</i>")
-
         links = []
-        if ds and ds != "-":
-            links.append(f'<a href="{ds}">📄 Даташит</a>')
-        if img and img != "-":
-            links.append(f'<a href="{img}">🖼 Фото</a>')
-
-        if links:
-            lines.append(" | ".join(links))
-
+        if ds and ds != "-": links.append(f'<a href="{ds}">📄 Даташит</a>')
+        if img and img != "-": links.append(f'<a href="{img}">🖼 Фото</a>')
+        if links: lines.append(" | ".join(links))
         lines.append("-" * 25)
     return "\n".join(lines)
 
+@dp.callback_query(F.data == "docs_cat_search")
+async def callback_docs_cat_search(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DocsCategoryState.waiting_for_search); await callback.message.answer("Поиск в категориях ДОКОВ (часть названия):"); await callback.answer()
+
+@dp.callback_query(F.data == "labeling_cat_search")
+async def callback_labeling_cat_search(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(LabelingCategoryState.waiting_for_search); await callback.message.answer("Поиск в категориях МАРКИРОВКИ (часть названия):"); await callback.answer()
+
+@dp.message(DocsCategoryState.waiting_for_search)
+async def handle_docs_cat_search(message: Message, state: FSMContext):
+    q = message.text.strip().lower(); res = [c for c in get_docs_categories() if q in c.lower()]
+    if not res: await message.answer("Ничего не найдено.")
+    else: await message.answer(f"🔍 Найдено ({len(res)}):\n\n" + "\n".join(await asyncio.to_thread(translate_cats_sync, res)))
+    await state.clear()
+
+@dp.message(LabelingCategoryState.waiting_for_search)
+async def handle_labeling_cat_search(message: Message, state: FSMContext):
+    q = message.text.strip().lower(); res = [c for c in get_labeling_categories() if q in c.lower()]
+    if not res: await message.answer("Ничего не найдено.")
+    else: await message.answer(f"🔍 Найдено ({len(res)}):\n\n" + "\n".join(await asyncio.to_thread(translate_cats_sync, res)))
+    await state.clear()
 
 @dp.message(F.text & ~F.text.startswith('/'))
 async def handle_text(message: Message, bot: Bot, state: FSMContext) -> None:
-    # Проверяем состояние
     current_state = await state.get_state()
+    # Игнорируем, если есть активное состояние (кроме UpdateState)
+    if current_state and current_state != UpdateState.waiting_for_data.state: return
+
     force_update = current_state == UpdateState.waiting_for_data.state
-    if force_update:
-        await state.clear()
-
-    # Для групп проверяем, упомянут ли бот или это ответ боту
+    if force_update: await state.clear()
     if message.chat.type != "private":
-        # Проверяем топик, если он задан
-        if ALLOWED_THREAD_ID is not None:
-            # message_thread_id может быть None в главном чате (General)
-            if message.message_thread_id != ALLOWED_THREAD_ID:
-                return
-
+        if ALLOWED_THREAD_ID and message.message_thread_id != ALLOWED_THREAD_ID: return
         bot_user = await bot.get_me()
-        is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == bot_user.id
-        is_mentioned = f"@{bot_user.username}" in message.text
-        if not (is_reply_to_bot or is_mentioned):
-            return
-
-    try:
-        api_key = _get_api_key()
-    except SystemExit:
-        await message.answer("Ошибка: MOUSER_API_KEY не настроен на сервере.")
-        return
-
-    # Очищаем текст от упоминания бота, если оно есть
-    bot_user = await bot.get_me()
-    text = message.text.replace(f"@{bot_user.username}", "").strip()
+        if not (message.reply_to_message and message.reply_to_message.from_user.id == bot_user.id or f"@{bot_user.username}" in message.text): return
+    try: api_key = _get_api_key()
+    except: await message.answer("Ключ не найден."); return
+    bot_user = await bot.get_me(); text = message.text.replace(f"@{bot_user.username}", "").strip()
     pns = _split_pns(text)
-    if not pns:
-        return
-
-    update_text = " (принудительное обновление)..." if force_update else "..."
-    msg = await message.answer(f"⏳ Ищу информацию по {len(pns)} деталям{update_text}")
-
-    # Сохраняем в историю
-    for pn in pns:
-        add_to_history(message.from_user.id, pn)
-
-    # Сохраняем последние PNs для выгрузки
-    _user_last_pns[message.from_user.id] = pns
-
-    # Запускаем синхронный парсинг
+    if not pns: return
+    msg = await message.answer(f"⏳ Ищу {len(pns)} деталей..."); _user_last_pns[message.from_user.id] = pns
+    for pn in pns: add_to_history(message.from_user.id, pn)
     results = await asyncio.to_thread(process_pns_sync, pns, api_key, force_update)
-
-    if not results:
-        await msg.edit_text("⚠️ Ничего не найдено или произошла ошибка.")
-        return
-
-    out_text = format_text_result(results)
-
-    # Клавиатура
-    keyboard = []
-    if len(pns) == 1:
-        # Если одна деталь, даем возможность очистить кэш
-        keyboard.append([InlineKeyboardButton(text="🔄 Очистить кэш этой детали", callback_data=f"clear_{pns[0][:40]}")])
-
-    keyboard.append([InlineKeyboardButton(text="📄 Выгрузить это в Excel", callback_data="export_excel")])
-    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-
+    if not results: await msg.edit_text("⚠️ Не найдено."); return
+    out_text = format_text_result(results); kb = []
+    if len(pns) == 1: kb.append([InlineKeyboardButton(text="🔄 Очистить кэш", callback_data=f"clear_{pns[0][:40]}")])
+    kb.append([InlineKeyboardButton(text="📄 Выгрузить в Excel", callback_data="export_excel")])
     if len(out_text) > 4000:
-        await msg.edit_text("✅ Готово! Результат слишком большой, формирую Excel-файл...")
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            tmp_name = tmp.name
-        await asyncio.to_thread(write_xlsx, results, tmp_name)
-        file = FSInputFile(tmp_name, filename="mouser_results.xlsx")
-        await message.answer_document(file)
-        os.remove(tmp_name)
-        await msg.delete()
-    else:
-        await msg.edit_text(
-            out_text, 
-            reply_markup=markup, 
-            link_preview_options=LinkPreviewOptions(is_disabled=True)
-        )
+        tmp_path = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name
+        await asyncio.to_thread(write_xlsx, results, tmp_path)
+        await message.answer_document(FSInputFile(tmp_path, filename="results.xlsx")); os.remove(tmp_path); await msg.delete()
+    else: await msg.edit_text(out_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+@dp.message(F.document)
+async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state == IPRegistryState.waiting_for_file.state:
+        clear_ip_brands(); return await _import_categories_from_xlsx(message, bot, state, add_ip_brand)
+    if current_state == DocsCategoryState.waiting_for_add.state:
+        return await _import_categories_from_xlsx(message, bot, state, add_docs_category)
+    if current_state == LabelingCategoryState.waiting_for_add.state:
+        return await _import_categories_from_xlsx(message, bot, state, add_labeling_category)
+    if current_state and current_state != UpdateState.waiting_for_data.state: return
+    force_update = current_state == UpdateState.waiting_for_data.state
+    if force_update: await state.clear()
+    doc = message.document
+    if not doc.file_name.lower().endswith('.xlsx'): await message.answer("Нужен .xlsx"); return
+    msg = await message.answer("⏳ Обработка..."); tmp_in = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name
+    await bot.download(doc, destination=tmp_in)
+    parts, err = await asyncio.to_thread(extract_pns_from_excel_sync, tmp_in)
+    if err == "NO_COLUMN":
+        tpl = await asyncio.to_thread(create_template_excel); await message.answer_document(FSInputFile(tpl, filename="Template.xlsx"), caption="❌ Нет колонки Part no."); os.remove(tpl); os.remove(tmp_in); await msg.delete(); return
+    elif err: os.remove(tmp_in); await msg.edit_text(f"❌ {err}"); return
+    api_key = _get_api_key(); res_map = {}; total = len(parts); last_t = asyncio.get_event_loop().time()
+    for idx, item in enumerate(parts):
+        row = await asyncio.to_thread(_lookup_one, item['pn'], api_key, force_update=force_update)
+        if row:
+            if item['brand']: row['brand_from_excel'] = item['brand']
+            res_map[item['pn'].lower()] = row
+        now = asyncio.get_event_loop().time()
+        if now - last_t > 1.0 or idx + 1 == total:
+            await msg.edit_text(f"⏳ {idx+1}/{total}\n{get_progress_bar(idx+1, total)}"); last_t = now
+    tmp_out = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name
+    await asyncio.to_thread(enrich_xlsx, tmp_in, tmp_out, res_map)
+    await message.answer_document(FSInputFile(tmp_out, filename=f"Enriched_{doc.file_name}")); os.remove(tmp_in); os.remove(tmp_out); await msg.delete()
+
+async def _import_categories_from_xlsx(message: Message, bot: Bot, state: FSMContext, add_func: Callable[[str], bool]):
+    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name; await bot.download(message.document, destination=tmp)
+    try:
+        wb = load_workbook(tmp, data_only=True); count = sum(1 for row in wb.active.iter_rows(min_row=1, max_col=1) if row[0].value and add_func(str(row[0].value).strip()))
+        await message.answer(f"✅ Добавлено: {count}")
+    except Exception as e: await message.answer(f"❌ {e}")
+    finally: os.remove(tmp); await state.clear()
 
 @dp.callback_query(F.data == "export_excel")
 async def callback_export_excel(callback: CallbackQuery):
     pns = _user_last_pns.get(callback.from_user.id)
-    if not pns:
-        await callback.answer("Данные устарели, отправьте парт-номера заново.", show_alert=True)
-        return
-
-    await callback.message.edit_reply_markup(reply_markup=None)
-    msg = await callback.message.answer("⏳ Формирую Excel-файл...")
-
-    api_key = _get_api_key()
-    results = await asyncio.to_thread(process_pns_sync, pns, api_key)
-
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        tmp_name = tmp.name
-    await asyncio.to_thread(write_xlsx, results, tmp_name)
-
-    file = FSInputFile(tmp_name, filename="mouser_results.xlsx")
-    await callback.message.answer_document(file)
-    os.remove(tmp_name)
-    await msg.delete()
-    await callback.answer()
+    if not pns: await callback.answer("Устарело."); return
+    await callback.message.edit_reply_markup(reply_markup=None); msg = await callback.message.answer("⏳ Формирую..."); api_key = _get_api_key()
+    results = await asyncio.to_thread(process_pns_sync, pns, api_key); tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False).name
+    await asyncio.to_thread(write_xlsx, results, tmp); await callback.message.answer_document(FSInputFile(tmp, filename="results.xlsx")); os.remove(tmp); await msg.delete(); await callback.answer()
 
 @dp.callback_query(F.data.startswith("clear_"))
 async def callback_clear_cache(callback: CallbackQuery):
-    pn = callback.data.split("_", 1)[1]
-    delete_cached_part(pn)
-    await callback.answer(f"Кэш для {pn} очищен! Можете искать заново.", show_alert=True)
-
-
-@dp.message(F.document)
-async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None:
-    # Проверяем состояние
-    current_state = await state.get_state()
-
-    if current_state == IPRegistryState.waiting_for_file.state:
-        doc = message.document
-        if not doc.file_name.lower().endswith(('.xlsx')):
-            await message.answer("Пожалуйста, отправьте файл в формате .xlsx")
-            return
-
-        msg = await message.answer("⏳ Читаю реестр ТРОИС...")
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            input_path = tmp.name
-        await bot.download(doc, destination=input_path)
-
-        try:
-            wb = load_workbook(input_path, data_only=True)
-            ws = wb.active
-            
-            clear_ip_brands()
-            count = 0
-            today = datetime.datetime.now().date()
-            
-            for row in ws.iter_rows(min_row=1):
-                if len(row) >= 5:
-                    val_a = row[0].value
-                    brand = row[1].value
-                    date_val = row[4].value
-                    
-                    if val_a and brand:
-                        val_a_str = str(val_a).strip()
-                        if "/" in val_a_str:
-                            exp_date = None
-                            if isinstance(date_val, datetime.datetime):
-                                exp_date = date_val.date()
-                            elif isinstance(date_val, str):
-                                try:
-                                    parts = date_val.split('.')
-                                    if len(parts) == 3:
-                                        exp_date = datetime.date(int(parts[2]), int(parts[1]), int(parts[0]))
-                                except Exception:
-                                    pass
-                            
-                            if exp_date and exp_date >= today:
-                                if add_ip_brand(str(brand)):
-                                    count += 1
-                                    
-            await msg.edit_text(f"✅ Реестр ТРОИС успешно обновлен! Загружено активных марок: <b>{count}</b>.")
-        except Exception as e:
-            await msg.edit_text(f"❌ Ошибка при чтении файла: {e}")
-        finally:
-            os.remove(input_path)
-            await state.clear()
-        return
-
-    # ЕСЛИ МЫ В РЕЖИМЕ ДОБАВЛЕНИЯ КАТЕГОРИЙ - импортируем их из Excel
-    if current_state == DocsCategoryState.waiting_for_add.state:
-        doc = message.document
-        if not doc.file_name.lower().endswith(('.xlsx')):
-            await message.answer("Пожалуйста, отправьте файл в формате .xlsx")
-            return
-
-        msg = await message.answer("⏳ Импортирую категории из файла...")
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            input_path = tmp.name
-        await bot.download(doc, destination=input_path)
-
-        try:
-            wb = load_workbook(input_path, data_only=True)
-            ws = wb.active
-            count = 0
-            # Берем значения из первой колонки
-            for row in ws.iter_rows(min_row=1, max_col=1):
-                val = row[0].value
-                if val and str(val).strip():
-                    if add_docs_category(str(val).strip()):
-                        count += 1
-            await msg.edit_text(f"✅ Импорт завершен! Добавлено <b>{count}</b> новых категорий.")
-        except Exception as e:
-            await msg.edit_text(f"❌ Ошибка импорта: {e}")
-        finally:
-            os.remove(input_path)
-            await state.clear()
-        return
-
-    force_update = current_state == UpdateState.waiting_for_data.state
-    if force_update:
-        await state.clear()
-
-    # Для групп проверяем, упомянут ли бот в подписи к файлу или файл отправлен в ответ боту
-    if message.chat.type != "private":
-        bot_user = await bot.get_me()
-        is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == bot_user.id
-        is_mentioned = message.caption and f"@{bot_user.username}" in message.caption
-        if not (is_reply_to_bot or is_mentioned):
-            return
-
-    doc = message.document
-    if not doc.file_name.lower().endswith(('.xlsx')):
-        await message.answer("Пожалуйста, отправьте файл в формате .xlsx")
-        return
-
-    try:
-        api_key = _get_api_key()
-    except SystemExit:
-        await message.answer("Ошибка: MOUSER_API_KEY не настроен на сервере.")
-        return
-
-    msg = await message.answer("⏳ Скачиваю файл...")
-    
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        input_path = tmp.name
-        
-    await bot.download(doc, destination=input_path)
-    
-    await msg.edit_text("⏳ Читаю Excel-файл...")
-    parts_data, err = await asyncio.to_thread(extract_pns_from_excel_sync, input_path)
-    os.remove(input_path)
-    
-    if err == "NO_COLUMN":
-        template_path = await asyncio.to_thread(create_template_excel)
-        file = FSInputFile(template_path, filename="Template.xlsx")
-        await msg.delete()
-        await message.answer_document(
-            file, 
-            caption="❌ Я не нашел нужную колонку ('Part no.').\n\nПожалуйста, используйте этот шаблон, заполните первую колонку и отправьте мне обратно."
-        )
-        os.remove(template_path)
-        return
-    elif err:
-        await msg.edit_text(f"❌ {err}")
-        return
-
-    if not parts_data:
-        await msg.edit_text("⚠️ Нет результатов для сохранения.")
-        return
-
-    # Сохраняем в историю
-    for item in parts_data:
-        add_to_history(message.from_user.id, item['pn'])
-
-    total_pns = len(parts_data)
-    update_text = " (принудительное обновление)" if force_update else ""
-    await msg.edit_text(f"⏳ Начинаю обработку {total_pns} деталей{update_text}...\n{get_progress_bar(0, total_pns)}")
-
-    all_results = []
-    processed = 0
-    last_update_time = asyncio.get_event_loop().time()
-    
-    # Обрабатываем по одному, чтобы прогресс бар был плавным
-    for item in parts_data:
-        pn = item['pn']
-        brand_from_excel = item['brand']
-        # Вызываем _lookup_one в отдельном потоке для каждого партномера
-        row = await asyncio.to_thread(_lookup_one, pn, api_key, 3, 20, None, force_update)
-        if row:
-            if brand_from_excel:
-                row['brand_from_excel'] = brand_from_excel
-            all_results.append(row)
-            
-        processed += 1
-        
-        # Обновляем сообщение не чаще 1 раза в секунду, чтобы не ловить лимиты Telegram (Flood Control)
-        current_time = asyncio.get_event_loop().time()
-        if current_time - last_update_time > 1.0 or processed == total_pns:
-            progress_text = (
-                f"⏳ Обработка файла (учитываем лимиты API)...\n\n"
-                f"Обработано: {processed} / {total_pns}\n"
-                f"{get_progress_bar(processed, total_pns)}\n\n"
-            )
-            try:
-                await msg.edit_text(progress_text)
-                last_update_time = current_time
-            except Exception as e:
-                # Игнорируем ошибки MessageNotModified
-                pass
-
-    await msg.edit_text("⏳ Формирую итоговый файл...")
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_out:
-        out_path = tmp_out.name
-        
-    await asyncio.to_thread(write_xlsx, all_results, out_path)
-    
-    file = FSInputFile(out_path, filename=f"mouser_result_{doc.file_name}")
-    await message.answer_document(file, caption="✅ Готово! Все детали обработаны.")
-    os.remove(out_path)
-    await msg.delete()
+    pn = callback.data.split("_", 1)[1]; delete_cached_part(pn); await callback.answer(f"Кэш {pn} очищен!")
 
 class AuthMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[types.TelegramObject, Dict[str, Any]], Awaitable[Any]],
-        event: types.TelegramObject,
-        data: Dict[str, Any]
-    ) -> Any:
-        # Если админ не задан, разрешаем всем
-        if not ADMIN_USER_ID:
-            return await handler(event, data)
-
+    async def __call__(self, handler, event, data):
+        if not ADMIN_USER_ID: return await handler(event, data)
         user = data.get('event_from_user')
-        if not user:
-            return await handler(event, data)
-
-        # Разрешаем админу и зарегистрированным пользователям
-        if user.id == ADMIN_USER_ID or is_user_allowed(user.id):
-            return await handler(event, data)
-        
-        # Остальным не отвечаем
-        return
+        if not user or user.id == ADMIN_USER_ID or is_user_allowed(user.id): return await handler(event, data)
+        if isinstance(event, types.Message) and event.chat.type == "private": await event.answer(f"⛔ Доступ ограничен. ID: {user.id}")
 
 async def main() -> None:
-    if not TOKEN:
-        logger.error("Задайте TELEGRAM_BOT_TOKEN перед запуском бота.")
-        sys.exit(1)
-        
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    
-    # Регистрируем middleware для всех апдейтов
     dp.update.middleware(AuthMiddleware())
+    await bot.set_my_commands([BotCommand(command="menu", description="📱 Меню"), BotCommand(command="history", description="🕒 История"), BotCommand(command="stats", description="📊 База")])
+    logger.info("Бот запущен."); await dp.start_polling(bot)
 
-    # Настраиваем команды в меню, чтобы пользователь не видел список слеш-команд
-    await bot.set_my_commands([
-        BotCommand(command="menu", description="Открыть главное меню"),
-        BotCommand(command="menu_update_all", description="Актуализация ПОЛНАЯ")
-    ])
-    
-    logger.info("Бот запущен. Ожидание сообщений...")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == "__main__": asyncio.run(main())

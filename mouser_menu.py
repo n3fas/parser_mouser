@@ -124,7 +124,11 @@ def _lookup_one(pn: str, api_key: str, retries: int = 3, timeout: int = 20,
     return row
 
 
-from openpyxl import load_workbook
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 def _process_excel_file(filepath: str, api_key: str, save_raw_dir: Path | None):
     p = Path(filepath)
@@ -146,7 +150,7 @@ def _process_excel_file(filepath: str, api_key: str, save_raw_dir: Path | None):
         for col_idx, cell in enumerate(row, start=1):
             if cell.value and isinstance(cell.value, str):
                 val_clean = cell.value.strip().lower().replace(" ", "").replace(".", "")
-                if val_clean in ("partno", "partnumber"):
+                if val_clean in ("partno", "partnumber", "part#", "pn"):
                     part_col_idx = col_idx
                     start_row = row_idx + 1
                     break
@@ -154,7 +158,7 @@ def _process_excel_file(filepath: str, api_key: str, save_raw_dir: Path | None):
             break
 
     if not part_col_idx:
-        print("  ❌ Столбец с партномером ('Part no.', 'PART NUMBER' и т.д.) не найден (проверены первые 50 строк).")
+        print("  ❌ Столбец с партномером ('Part no.', 'PART NUMBER' и т.д.) не найден.")
         return
 
     print(f"  ✓ Найден целевой столбец (столбец {part_col_idx}, начиная со строки {start_row}).")
@@ -171,19 +175,12 @@ def _process_excel_file(filepath: str, api_key: str, save_raw_dir: Path | None):
         return
 
     print(f"  ✓ Найдено {len(pns)} парт-номеров.")
-
-    chunks = [pns[i:i + 50] for i in range(0, len(pns), 50)]
-    print(f"  ✓ Разбито на {len(chunks)} пачек (по 50 макс).")
-
     all_results = []
 
-    for i, chunk in enumerate(chunks, start=1):
-        print(f"\n  [Пачка {i}/{len(chunks)}] Обработка {len(chunk)} деталей...")
-        for pn in chunk:
-            print(f"  → Ищу: {pn} ...")
-            row = _lookup_one(pn, api_key, retries=3, timeout=20, save_raw_dir=save_raw_dir)
-            if row:
-                all_results.append(row)
+    for pn in tqdm(pns, desc="Processing Excel rows"):
+        row = _lookup_one(pn, api_key, retries=3, timeout=20, save_raw_dir=save_raw_dir)
+        if row:
+            all_results.append(row)
 
     if all_results:
         out_name = f"mouser_excel_result_{p.stem}.xlsx"
@@ -199,7 +196,7 @@ def main():
     try:
         api_key = _get_api_key()
     except SystemExit:
-        print("Создайте .env с MOUSER_API_KEY=... (или экспортируйте переменную окружения) и запустите снова.")
+        print("Создайте .env с MOUSER_API_KEY=... и запустите снова.")
         return
 
     results_map: Dict[str, Dict[str, Any]] = {}
@@ -227,9 +224,7 @@ def main():
                 print("  ⚠️  Ничего не введено.")
                 continue
 
-            results = []
-            for pn in pns:
-                print(f"  → Ищу: {pn} ...")
+            for pn in tqdm(pns, desc="Searching"):
                 row = _lookup_one(pn, api_key, retries=3, timeout=20, save_raw_dir=save_raw_dir)
                 if row:
                     key = pn.strip().lower()
@@ -248,8 +243,7 @@ def main():
             if not results_map:
                 print("  ⚠️  Нет данных для сохранения. Сначала выполните поиск (пункт 1).")
                 continue
-            out = _ask("Имя файла CSV (по умолчанию: mouser_results.csv): ")
-            out = out or "mouser_results.csv"
+            out = _ask("Имя файла CSV (по умолчанию: mouser_results.csv): ") or "mouser_results.csv"
             try:
                 write_csv(list(results_map.values()), out)
                 print(f"  ✓ CSV сохранён → {out}")
@@ -260,8 +254,7 @@ def main():
             if not results_map:
                 print("  ⚠️  Нет данных для сохранения. Сначала выполните поиск (пункт 1).")
                 continue
-            out = _ask("Имя файла JSON (по умолчанию: mouser_results.json): ")
-            out = out or "mouser_results.json"
+            out = _ask("Имя файла JSON (по умолчанию: mouser_results.json): ") or "mouser_results.json"
             try:
                 _save_json(list(results_map.values()), out)
                 print(f"  ✓ JSON сохранён → {out}")
@@ -294,14 +287,11 @@ def main():
                 
         elif choice == "6":
             filepath = _ask("Введите путь к Excel файлу: ")
-            if not filepath:
-                print("  ⚠️  Отмена.")
-                continue
+            if not filepath: continue
             _process_excel_file(filepath, api_key, save_raw_dir)
             
         else:
             print("  ⚠️  Неверный выбор. Попробуйте ещё раз.")
-
 
 if __name__ == "__main__":
     main()
