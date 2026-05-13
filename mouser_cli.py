@@ -39,6 +39,9 @@ API_KEYWORD    = "https://api.mouser.com/api/v1.0/search/keyword"
 
 load_dotenv(find_dotenv(), override=False)
 
+_PROXY_URL = os.getenv("TELEGRAM_PROXY")
+_PROXIES = {"http": _PROXY_URL, "https": _PROXY_URL} if _PROXY_URL else None
+
 def _translate_to_ru(text: Optional[str]) -> Optional[str]:
     if not text or not text.strip() or GoogleTranslator is None:
         return text
@@ -131,7 +134,14 @@ def _post_json(url: str, params: Dict[str, str], payload: Dict[str, Any],
         attempt += 1
         _enforce_rate_limit()
         try:
-            resp = requests.post(url, params=params, json=payload, headers=headers, timeout=timeout)
+            resp = requests.post(
+                url, 
+                params=params, 
+                json=payload, 
+                headers=headers, 
+                timeout=timeout,
+                proxies=_PROXIES
+            )
         except requests.RequestException as e:
             if attempt <= max_retries:
                 delay = 2 ** attempt

@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import html
 import tempfile
 import math
 import datetime
@@ -386,12 +387,12 @@ def format_text_result(results):
     lines = []
     for r in results:
         req_pn = r.get("Запрошенный партномер", "-")
-        mfr = r.get("Производитель", "-")
-        cat_ru = r.get("Категория", "-")
+        mfr = html.escape(str(r.get("Производитель", "-")))
+        cat_ru = html.escape(str(r.get("Категория", "-")))
         cat_en = r.get("Категория (EN)")
         desc = r.get("Описание", "-")
         ds = r.get("Даташит"); img = r.get("Ссылка на фото")
-        lines.append(f"🔍 <b>{req_pn}</b>\nПроизводитель: {mfr}\nКатегория: {cat_ru}")
+        lines.append(f"🔍 <b>{html.escape(str(req_pn))}</b>\nПроизводитель: {mfr}\nКатегория: {cat_ru}")
         warns = []
         # Проверяем и английское, и русское название категории
         for c_val in [cat_en, cat_ru]:
@@ -401,7 +402,10 @@ def format_text_result(results):
         brand_excel = r.get("brand_from_excel")
         if (brand_excel and is_ip_brand(brand_excel)) or (mfr and mfr != "-" and is_ip_brand(mfr)): warns.append("⛔ ТРОИС")
         if warns: lines.append("⚠️ <b>Внимание:</b> " + ", ".join(warns))
-        lines.append(f"Описание: {desc}")
+        
+        # Экранируем описание, так как там может быть сырой HTML при ошибках Mouser
+        safe_desc = html.escape(str(desc))
+        lines.append(f"Описание: {safe_desc}")
         links = []
         if ds and ds != "-": links.append(f'<a href="{ds}">📄 Даташит</a>')
         if img and img != "-": links.append(f'<a href="{img}">🖼 Фото</a>')
@@ -419,14 +423,28 @@ async def callback_labeling_cat_search(callback: CallbackQuery, state: FSMContex
 
 @dp.message(DocsCategoryState.waiting_for_search)
 async def handle_docs_cat_search(message: Message, state: FSMContext):
-    q = message.text.strip().lower(); res = [c for c in get_docs_categories() if q in c.lower()]
+    q = message.text.strip().lower()
+    all_cats = get_docs_categories()
+    res = []
+    for c in all_cats:
+        t = _translate_to_ru(c).lower() if c else ""
+        if q in c.lower() or (t and q in t):
+            res.append(c)
+    
     if not res: await message.answer("Ничего не найдено.")
     else: await message.answer(f"🔍 Найдено ({len(res)}):\n\n" + "\n".join(await asyncio.to_thread(translate_cats_sync, res)))
     await state.clear()
 
 @dp.message(LabelingCategoryState.waiting_for_search)
 async def handle_labeling_cat_search(message: Message, state: FSMContext):
-    q = message.text.strip().lower(); res = [c for c in get_labeling_categories() if q in c.lower()]
+    q = message.text.strip().lower()
+    all_cats = get_labeling_categories()
+    res = []
+    for c in all_cats:
+        t = _translate_to_ru(c).lower() if c else ""
+        if q in c.lower() or (t and q in t):
+            res.append(c)
+            
     if not res: await message.answer("Ничего не найдено.")
     else: await message.answer(f"🔍 Найдено ({len(res)}):\n\n" + "\n".join(await asyncio.to_thread(translate_cats_sync, res)))
     await state.clear()
